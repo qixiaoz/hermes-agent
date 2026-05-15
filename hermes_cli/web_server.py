@@ -3290,6 +3290,19 @@ def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
+@app.get("/favicon.ico")
+async def favicon_ico():
+    """Serve a custom favicon if set via app.state, otherwise fall back to the built-in."""
+    from fastapi.responses import FileResponse
+    custom: str = getattr(app.state, "custom_favicon_path", "") or ""
+    if custom and os.path.isfile(custom):
+        return FileResponse(custom, media_type="image/x-icon")
+    builtin = WEB_DIST / "favicon.ico"
+    if builtin.is_file():
+        return FileResponse(builtin, media_type="image/x-icon")
+    return Response(status_code=404)
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
@@ -3571,6 +3584,11 @@ def mount_spa(application: FastAPI):
         or empty string when served at root.
         """
         html = _index_path.read_text()
+        # Inject custom per-profile title if set
+        _custom_title: str = getattr(application.state, "custom_title", "") or ""
+        if _custom_title:
+            import re as _re
+            html = _re.sub(r"<title>.*?</title>", f"<title>{_custom_title}</title>", html, count=1)
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         token_script = (
             f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
@@ -4405,6 +4423,8 @@ def start_server(
     allow_public: bool = False,
     *,
     embedded_chat: bool = False,
+    title: str = "",
+    favicon_path: str = "",
 ):
     """Start the web UI server."""
     import uvicorn
@@ -4431,6 +4451,15 @@ def start_server(
     # PTY child uses to publish events to the dashboard sidebar.
     app.state.bound_host = host
     app.state.bound_port = port
+
+    # Custom title / favicon override (per-profile dashboard branding)
+    if title:
+        app.title = title
+    app.state.custom_title = title
+    if favicon_path and os.path.isfile(favicon_path):
+        app.state.custom_favicon_path = favicon_path
+    else:
+        app.state.custom_favicon_path = ""
 
     if open_browser:
         import webbrowser

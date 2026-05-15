@@ -9120,6 +9120,8 @@ def cmd_dashboard(args):
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
         embedded_chat=embedded_chat,
+        title=os.environ.get("HERMES_DASHBOARD_TITLE", ""),
+        favicon_path=os.environ.get("HERMES_DASHBOARD_FAVICON", ""),
     )
 
 
