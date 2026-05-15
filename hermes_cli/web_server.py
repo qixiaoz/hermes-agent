@@ -4449,7 +4449,11 @@ def start_server(
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
     # bound_port is also stashed so /api/pty can build the back-WS URL the
     # PTY child uses to publish events to the dashboard sidebar.
-    app.state.bound_host = host
+    # When --insecure is set, always accept any Host header (the operator
+    # has explicitly opted into binding to a non-loopback interface, or
+    # is running behind a reverse proxy like Tailscale Serve).  The socket
+    # still binds to the requested host; only the Host-header check is relaxed.
+    app.state.bound_host = "0.0.0.0" if allow_public else host
     app.state.bound_port = port
 
     # Custom title / favicon override (per-profile dashboard branding)
