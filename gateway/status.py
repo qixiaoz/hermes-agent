@@ -1255,24 +1255,18 @@ def _consume_pid_marker_for_self(
 
     our_pid = os.getpid()
     our_start_time = _get_process_start_time(our_pid)
-    # Start-time is a PID-reuse guard. It is only meaningful when both
-    # sides actually have it: ``_get_process_start_time`` returns None on
-    # platforms without ``/proc`` (macOS, native Windows — the very
-    # platform the planned-stop watcher exists for). Requiring a non-None
-    # match there would make every consume return False, so a legitimate
-    # ``hermes gateway stop`` on Windows would be misclassified as an
-    # unexpected ``UNKNOWN`` exit (exit 1) and revived by the service
-    # manager. So: when both start_times are known they must match; when
-    # either is unknown, fall back to PID equality alone (bounded by the
-    # marker's short TTL). This mirrors ``planned_stop_marker_targets_self``
-    # so the watcher's non-destructive probe and this authoritative
-    # consume agree on every platform (issue #34597).
-    if target_pid != our_pid:
-        matches = False
-    elif target_start_time is not None and our_start_time is not None:
-        matches = target_start_time == our_start_time
+    # On platforms without /proc (macOS, Windows), start_time is always None.
+    # Fall back to PID-only matching since the marker has a 60s TTL, making
+    # PID-reuse races vanishingly unlikely.
+    if target_start_time is None and our_start_time is None:
+        matches = target_pid == our_pid
     else:
-        matches = True
+        matches = (
+            target_pid == our_pid
+            and target_start_time is not None
+            and our_start_time is not None
+            and target_start_time == our_start_time
+        )
 
     try:
         path.unlink(missing_ok=True)
