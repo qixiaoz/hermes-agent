@@ -352,20 +352,23 @@ class TestAsyncWriterRetry:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise ConnectionError("network blip")
-            # second call succeeds silently
+            return True  # second call succeeds
 
         mgr._flush_session = flaky_flush
 
-        with patch("time.sleep"):  # skip the 2s sleep in retry
+        with patch("time.sleep"):  # skip the backoff sleeps
             mgr._async_queue.put(sess)
             deadline = time.time() + 3.0
             while call_count[0] < 2 and time.time() < deadline:
                 time.sleep(0.05)
 
         mgr.shutdown()
-        assert call_count[0] == 2
+        # First call raises exception, second call succeeds → stop retrying
+        assert call_count[0] == 2, f"Expected 2 calls, got {call_count[0]}"
 
-    def test_drops_after_two_failures(self):
+    def test_retries_with_backoff_then_fallback(self):
+        """After repeated failures, exponential backoff kicks in and eventually
+        saves to disk fallback instead of dropping the data."""
         mgr = _make_manager(write_frequency="async")
         sess = _make_session()
         sess.add_message("user", "msg")
@@ -378,15 +381,26 @@ class TestAsyncWriterRetry:
 
         mgr._flush_session = always_fail
 
+        # Suppress disk writes during test
+        saved_to_disk = [False]
+
+        def fake_save_to_fallback(session, fallback_dir):
+            saved_to_disk[0] = True
+
+        mgr._save_to_fallback = fake_save_to_fallback
+
         with patch("time.sleep"):
             mgr._async_queue.put(sess)
+            # The backoff loop calls flush_session: 1 (outer) + 5 (inner: 2,4,8,16,30) = 6
             deadline = time.time() + 3.0
-            while call_count[0] < 2 and time.time() < deadline:
+            while call_count[0] < 6 and time.time() < deadline:
                 time.sleep(0.05)
 
         mgr.shutdown()
-        # Should have tried exactly twice (initial + one retry) and not crashed
-        assert call_count[0] == 2
+        # Tried 6 times (1 initial + 5 retries with backoff 2,4,8,16,30),
+        # then hit max_backoff → saved to disk
+        assert call_count[0] == 6, f"Expected 6 calls, got {call_count[0]}"
+        assert saved_to_disk[0], "Should have saved to disk fallback"
         assert not mgr._async_thread.is_alive()
 
     def test_retries_when_flush_reports_failure(self):
