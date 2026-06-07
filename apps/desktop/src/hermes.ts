@@ -1394,7 +1394,8 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
     // TTS blocks until provider synthesis, file read, and base64 encoding
     // finish. Remote providers and large messages regularly exceed the
     // default 15s Electron backend timeout.
-    timeoutMs: audioSpeakRequestTimeoutMs(text)
+    timeoutMs: audioSpeakRequestTimeoutMs(text),
+    ...profileScoped()
   })
 }
 
