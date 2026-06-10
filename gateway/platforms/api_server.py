@@ -1395,6 +1395,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1512,6 +1513,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -1586,7 +1588,7 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — list hermes-agent and any configured model_routes aliases."""
+        """GET /v1/models — list hermes-agent plus configured route aliases."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -1603,12 +1605,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "parent": None,
             }
         ]
+        seen = {self._model_name}
         # Expose configured model route aliases so clients can discover them.
         # Only the alias and resolved model name are exposed — never provider
         # credentials.
         for alias, route_cfg in self._model_routes.items():
-            if alias == self._model_name:
+            if alias in seen:
                 continue  # already listed above
+            seen.add(alias)
             models.append({
                 "id": alias,
                 "object": "model",
@@ -2137,10 +2141,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
-                _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
+                return
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+
+        def _reasoning_delta(delta: str) -> None:
+            if delta:
+                _enqueue("reasoning.delta", {"message_id": message_id, "delta": delta})
 
         async def _run_and_signal() -> None:
             try:
@@ -2154,6 +2162,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    reasoning_callback=_reasoning_delta,
                     gateway_session_key=gateway_session_key,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2211,8 +2220,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 if item is None:
                     break
                 name, payload = item
-                data = json.dumps(payload, ensure_ascii=False)
-                await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
+                if name == "reasoning.delta":
+                    # Emit as OpenAI-compatible reasoning_content chunk so
+                    # Chatbox / Open WebUI / standard clients display
+                    # model thinking inline.
+                    delta_text = payload.get("delta", "")
+                    if delta_text:
+                        reasoning_chunk = {
+                            "id": run_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": self._model_name,
+                            "choices": [{"index": 0, "delta": {"reasoning_content": delta_text}, "finish_reason": None}],
+                        }
+                        await response.write(f"data: {json.dumps(reasoning_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+                else:
+                    data = json.dumps(payload, ensure_ascii=False)
+                    await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
         except (asyncio.CancelledError, ConnectionResetError):
             task.cancel()
@@ -2243,6 +2265,22 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        # Opt-in flag for non-standard SSE events.  Strict OpenAI clients
+        # (iOS Chatbox, LibreChat, LobeChat) validate every ``data:`` line
+        # as a ChatCompletionChunk and reject unknown fields in tool_calls[]
+        # with Pydantic TypeValidationError.  The custom ``hermes.tool.progress``
+        # event carries ``tool``/``emoji``/``label``/``toolCallId``/``status``
+        # fields that don't exist in the OpenAI schema, so by default we
+        # suppress it.  Clients that want to see live tool activity can
+        # opt in via the ``X-Hermes-Progress-Events: true`` request header
+        # (or ``?progress=1`` query string for SSE clients that can't set
+        # headers, e.g. EventSource in browsers).
+        # See references/reasoning-content-openwebui-implementation.md
+        # for the Pydantic failure mode that motivated this flag.
+        _progress_header = request.headers.get("X-Hermes-Progress-Events", "").strip().lower()
+        _progress_query = request.query.get("progress", "").strip().lower()
+        enable_progress_events = _progress_header in ("1", "true", "yes") or _progress_query in ("1", "true", "yes")
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -2371,6 +2409,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_reasoning(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                # NO-OP: the ``reasoning.available`` preview path is
+                # intentionally NOT wired to the SSE stream because
+                # ``agent/conversation_loop.py`` line ~3362 fires it with
+                # ``preview=assistant_message.content[:500]`` whenever the
+                # agent has any content — even when no real reasoning was
+                # produced (e.g. M3 with no reasoning effort).  Pushing
+                # that preview into the SSE stream causes strict OpenAI
+                # clients (iOS Chatbox, LibreChat) to render the reply
+                # text TWICE: once in the "thinking" panel and once in
+                # the actual reply area.  See
+                # references/reasoning-content-openwebui-implementation.md
+                # (pitfall 1b) for the full diagnosis.
+                #
+                # The only safe reasoning path is ``_on_reasoning_delta``,
+                # which fires per-``delta.reasoning_content`` chunk — that
+                # path can ONLY get triggered if the provider actually
+                # emitted reasoning, so non-reasoning models stay silent.
+                return
+
+            def _on_reasoning_delta(text):
+                """Forward raw reasoning_content deltas into the SSE stream.
+
+                This is the ``reasoning_callback`` path — fired by
+                ``_fire_reasoning_delta()`` for every
+                ``delta.reasoning_content`` chunk the provider emits
+                (DeepSeek, MiniMax-M3, etc.).
+                """
+                if text:
+                    _stream_q.put(("__reasoning__", text))
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -2389,7 +2458,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 Skips tools whose names start with ``_`` so internal
                 events (``_thinking``, …) stay off the wire — matching
                 the prior ``_on_tool_progress`` filter exactly.
+
+                Gated by ``enable_progress_events`` (opt-in via the
+                ``X-Hermes-Progress-Events: true`` header or
+                ``?progress=1`` query string) because strict OpenAI
+                clients (iOS Chatbox, LibreChat, LobeChat) reject the
+                non-standard ``tool``/``emoji``/``label``/``toolCallId``/
+                ``status`` fields with a Pydantic TypeValidationError.
+                See ``_handle_chat_completions`` for the header parser.
                 """
+                if not enable_progress_events:
+                    return
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
@@ -2409,7 +2488,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 Dropped if the start was filtered (internal tool, missing
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
+
+                Also gated by ``enable_progress_events`` for symmetry with
+                ``_on_tool_start`` — if progress events are off, we don't
+                emit the completion either.  The start gate already
+                prevents the orphaned-completed case in practice; this
+                just avoids the wasted work of generating the dict.
                 """
+                if not enable_progress_events:
+                    return
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
@@ -2425,8 +2512,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # ``tool_progress_callback`` is intentionally not wired here:
             # it would duplicate every emit because ``run_agent`` fires it
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
+            # The structured callbacks are strictly richer (they carry the
+            # tool_call id), so they own the chat-completions SSE channel.
+            # EXCEPTION: ``_on_reasoning`` is still wired as a NO-OP guard for
+            # the legacy preview path, while ``_on_reasoning_delta`` forwards
+            # provider-native ``delta.reasoning_content`` chunks (DeepSeek,
+            # MiniMax-M3, etc.).
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -2436,6 +2527,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                tool_progress_callback=_on_reasoning,
+                reasoning_callback=_on_reasoning_delta,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
@@ -2621,6 +2714,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning__":
+                    # Emit as OpenAI-compatible delta.reasoning_content chunk.
+                    reasoning_text = item[1]
+                    reasoning_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": reasoning_text}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode())
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -4203,6 +4305,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
@@ -4240,6 +4343,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=tool_progress_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
+                    reasoning_callback=reasoning_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
                 )

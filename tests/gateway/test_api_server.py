@@ -678,6 +678,22 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_reasoning_callback_to_agent(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        callback = MagicMock()
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create:
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+                reasoning_callback=callback,
+            )
+
+        assert mock_create.call_args.kwargs["reasoning_callback"] is callback
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint
@@ -1374,6 +1390,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
                 resp = await cli.post(
                     "/v1/chat/completions",
+                    headers={"X-Hermes-Progress-Events": "true"},
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "list files"}],
@@ -1410,6 +1427,41 @@ class TestChatCompletionsEndpoint:
                 assert "Here are the files." in body
 
     @pytest.mark.asyncio
+    async def test_stream_suppresses_tool_progress_by_default(self, adapter):
+        """Strict OpenAI clients should not receive non-standard progress events unless opted in."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                if ts_cb:
+                    ts_cb("call_terminal_1", "terminal", {"command": "ls -la"})
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Here are the files.")
+                return (
+                    {"final_response": "Here are the files.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list files"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.tool.progress" not in body
+                assert "Here are the files." in body
+                assert "[DONE]" in body
+
+    @pytest.mark.asyncio
     async def test_stream_tool_progress_skips_internal_events(self, adapter):
         """Internal tool calls (name starting with ``_``) are not streamed."""
         import asyncio
@@ -1433,6 +1485,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
                 resp = await cli.post(
                     "/v1/chat/completions",
+                    headers={"X-Hermes-Progress-Events": "true"},
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "search"}],
@@ -1496,6 +1549,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
                 resp = await cli.post(
                     "/v1/chat/completions",
+                    headers={"X-Hermes-Progress-Events": "true"},
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "list"}],
@@ -1564,6 +1618,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
                 resp = await cli.post(
                     "/v1/chat/completions",
+                    headers={"X-Hermes-Progress-Events": "true"},
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "ok"}],
@@ -3963,6 +4018,31 @@ class TestModelRoutesModelsEndpoint:
             assert alias_entry["parent"] == adapter._model_name
             # per-route api_key must never leak through the discovery endpoint
             assert "sk-route-secret" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_ignores_legacy_exposed_models(self, monkeypatch):
+        adapter = _make_routing_adapter({})
+        app = _create_app(adapter)
+
+        def _legacy_gateway_config():
+            return {
+                "gateway": {
+                    "api_server": {
+                        "exposed_models": [
+                            {"id": "legacy-alias", "model": "openai/gpt-5"},
+                        ],
+                    },
+                },
+            }
+
+        monkeypatch.setattr("gateway.run._load_gateway_config", _legacy_gateway_config)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            ids = {m["id"] for m in data["data"]}
+            assert "legacy-alias" not in ids
 
 
 class TestModelRoutesHandlers:
