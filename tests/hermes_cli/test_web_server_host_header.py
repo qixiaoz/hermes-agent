@@ -25,6 +25,26 @@ class TestHostHeaderValidator:
 
 
 
+    def test_loopback_bind_accepts_extra_hosts_from_env(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "DASHBOARD_EXTRA_HOSTS",
+            "dashboard.example.test, proxy.example.test",
+        )
+
+        assert _is_accepted_host("dashboard.example.test", "127.0.0.1")
+        assert _is_accepted_host("proxy.example.test:9119", "localhost")
+        assert _is_accepted_host("DASHBOARD.EXAMPLE.TEST", "127.0.0.1")
+
+    def test_loopback_extra_hosts_do_not_widen_to_unlisted_hosts(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv("DASHBOARD_EXTRA_HOSTS", "dashboard.example.test")
+
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
+        assert not _is_accepted_host("proxy.example.test", "127.0.0.1")
+
     def test_zero_zero_bind_accepts_anything(self):
         """0.0.0.0 means operator explicitly opted into all-interfaces
         (requires --insecure). No Host-layer defence is possible — rely
