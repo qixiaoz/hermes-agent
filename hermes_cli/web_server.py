@@ -529,7 +529,19 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        if host_only in _LOOPBACK_HOST_VALUES:
+            return True
+        # DASHBOARD_EXTRA_HOSTS: comma-separated list of extra hostnames to
+        # accept when bound to loopback. Use case: Tailscale serve forwards to
+        # 127.0.0.1:<port> but the original Host header is the Tailscale DNS
+        # name (e.g. dashboard.tailnet.example). Without this allowance
+        # the DNS rebinding middleware would reject the proxy's request.
+        extra_hosts_raw = os.environ.get("DASHBOARD_EXTRA_HOSTS", "").strip()
+        if extra_hosts_raw:
+            extra_hosts = {h.strip().lower() for h in extra_hosts_raw.split(",") if h.strip()}
+            if host_only in extra_hosts:
+                return True
+        return False
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
