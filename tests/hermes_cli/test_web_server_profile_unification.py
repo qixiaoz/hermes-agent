@@ -6,6 +6,8 @@ profile switcher can target any profile's HERMES_HOME. These tests pin:
 reads/writes land in the REQUESTED profile, the dashboard's own profile
 stays untouched, and the chat PTY env is scoped via HERMES_HOME.
 """
+import os
+
 import pytest
 import yaml
 
@@ -332,6 +334,72 @@ class TestProfileScopedGateway:
         assert data["gateway_pid"] == 4242
         assert data["gateway_state"] == "running"
         assert data["gateway_platforms"] == {"telegram": {"state": "connected"}}
+
+    def test_status_connected_platforms_bridge_profile_env(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Regression: the dashboard process loads the DEFAULT profile's ``.env``
+        at startup, so ``load_gateway_config()`` — which reads platform tokens
+        via ``os.getenv()`` — sees the default profile's tokens, not the
+        requested profile's. The status endpoint must bridge the requested
+        profile's ``.env`` into ``os.environ`` for the duration of the
+        ``get_connected_platforms()`` call, otherwise the runtime-vs-configured
+        filter silently drops every platform whose credentials live only in the
+        profile's ``.env`` (the dashboard would show only platforms whose
+        tokens happen to also be in the default profile's ``.env``).
+
+        This test runs the REAL ``load_gateway_config()`` (no monkeypatch) so
+        it exercises the env-bridge end-to-end.
+        """
+        import hermes_cli.web_server as web_server
+
+        # Default profile: empty .env (no platform tokens at all). This mimics
+        # the real dashboard scenario where the default home has no telegram
+        # token but the worker profile does.
+        default_home = isolated_profiles["default"]
+        (default_home / ".env").write_text("", encoding="utf-8")
+
+        # Worker profile: has a TELEGRAM_BOT_TOKEN in its .env (the token that
+        # makes load_gateway_config() recognise telegram as connected).
+        worker_home = isolated_profiles["worker_beta"]
+        (worker_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=worker-secret-token\n",
+            encoding="utf-8",
+        )
+
+        # Runtime status says telegram is connected on the worker profile.
+        runtime = {
+            "pid": 7777,
+            "gateway_state": "running",
+            "platforms": {"telegram": {"state": "connected"}},
+            "exit_reason": None,
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        # Current upstream routes status liveness through the TTL-cached
+        # wrapper; patch that seam so the test isolates the profile env bridge
+        # rather than probing the host's real gateway process.
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 7777)
+        monkeypatch.setattr(web_server, "read_runtime_status", lambda: runtime)
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+
+        # Make sure no ambient token leaks in from the test runner's env.
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+        resp = client.get("/api/status", params={"profile": "worker_beta"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # Without the env-bridge fix, configured_gateway_platforms would be
+        # empty (default .env has no token) and the filter would drop
+        # telegram from the runtime map → gateway_platforms == {}.
+        assert data["gateway_platforms"] == {
+            "telegram": {"state": "connected"},
+        }
+
+        # The bridge must restore os.environ after the call — the dashboard's
+        # own env must not be permanently polluted with the worker's token.
+        assert os.environ.get("TELEGRAM_BOT_TOKEN") in (None, "")
 
 
 class TestProfileScopedTelegramOnboarding:
