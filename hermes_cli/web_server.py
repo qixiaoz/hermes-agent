@@ -3168,10 +3168,18 @@ async def get_status(profile: Optional[str] = None):
         try:
             from gateway.config import load_gateway_config
 
-            gateway_config = load_gateway_config()
-            configured_gateway_platforms = {
-                platform.value for platform in gateway_config.get_connected_platforms()
-            }
+            # load_gateway_config() reads platform tokens via os.getenv(), so
+            # it sees the dashboard process's startup .env (the DEFAULT profile's)
+            # rather than the requested profile's. Bridge the profile's .env in
+            # for the duration of the call so get_connected_platforms() reflects
+            # the profile the dashboard is actually asking about — otherwise the
+            # runtime-vs-configured filter silently drops platforms whose
+            # credentials live in the profile's .env.
+            with _profile_env_bridge_scope():
+                gateway_config = load_gateway_config()
+                configured_gateway_platforms = {
+                    platform.value for platform in gateway_config.get_connected_platforms()
+                }
         except Exception:
             configured_gateway_platforms = None
 
@@ -15649,6 +15657,60 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
+
+
+# Serializes env-bridging scopes. ``load_gateway_config()`` reads platform
+# tokens (TELEGRAM_BOT_TOKEN, QQ_APP_ID, WEIXIN_TOKEN, API_SERVER_KEY, …)
+# directly from ``os.environ`` via ``os.getenv()``. When the dashboard serves a
+# ``?profile=<name>`` request it runs in the *dashboard's* own process, whose
+# ``os.environ`` was seeded from the DEFAULT profile's ``.env`` at startup —
+# NOT the requested profile's. Without bridging, ``get_connected_platforms()``
+# sees only the default profile's tokens and the status filter (which keeps
+# runtime platforms that are ALSO configured) silently drops every platform
+# whose credentials live in the profile's ``.env``. The lock guards sync
+# threadpool workers; within the event loop there is no ``await`` between
+# ``__enter__`` and the ``load_gateway_config()`` call, so coroutines cannot
+# interleave mid-swap.
+_PROFILE_ENV_BRIDGE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _profile_env_bridge_scope():
+    """Temporarily overlay the active profile's ``.env`` onto ``os.environ``.
+
+    Reads ``load_env()`` (which resolves ``get_hermes_home()/.env`` at call
+    time, so the contextvar override from ``_config_profile_scope`` reaches
+    it) and bridges every key it defines into ``os.environ`` for the duration
+    of the ``with`` block, restoring the prior state on exit. This lets
+    ``load_gateway_config()`` — which only consults ``os.getenv()`` — see the
+    profile's platform credentials when called from a different process
+    (the dashboard) that loaded a different ``.env`` at startup.
+
+    Only keys present in the profile's ``.env`` are touched, and the previous
+    value (or absence) of each is restored, so this is safe to nest under a
+    non-profile request (where ``load_env()`` returns the dashboard's own
+    ``.env`` and the overlay is a no-op restore).
+    """
+    saved: dict[str, str | None] = {}
+    applied: list[str] = []
+    with _PROFILE_ENV_BRIDGE_LOCK:
+        try:
+            env_vars = load_env()
+        except Exception:
+            env_vars = {}
+        for key, value in env_vars.items():
+            saved[key] = os.environ.get(key)
+            os.environ[key] = value
+            applied.append(key)
+        try:
+            yield
+        finally:
+            for key in applied:
+                prior = saved.get(key)
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
 
 
 class SkillToggle(BaseModel):
