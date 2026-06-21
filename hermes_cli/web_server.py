@@ -3634,7 +3634,7 @@ def _collect_profile_gateway_topology_cached() -> Dict[str, Any]:
         return data
 
 
-def _load_configured_gateway_platforms() -> set[str]:
+def _load_configured_gateway_platforms(profile_home: Optional[Path] = None) -> set[str]:
     """Load connected platform names away from the asyncio event loop.
 
     The first ``load_gateway_config()`` call performs platform discovery and
@@ -3644,8 +3644,9 @@ def _load_configured_gateway_platforms() -> set[str]:
     """
     from gateway.config import load_gateway_config
 
-    gateway_config = load_gateway_config()
-    return {platform.value for platform in gateway_config.get_connected_platforms()}
+    with _profile_secret_scope(profile_home):
+        gateway_config = load_gateway_config()
+        return {platform.value for platform in gateway_config.get_connected_platforms()}
 
 
 @app.get("/api/ssh/ownership")
@@ -3836,7 +3837,8 @@ async def get_status(profile: Optional[str] = None):
         configured_gateway_platforms: set[str] | None = None
         try:
             configured_gateway_platforms = await run_in_threadpool(
-                _load_configured_gateway_platforms
+                _load_configured_gateway_platforms,
+                profile_dir,
             )
         except Exception:
             configured_gateway_platforms = None
@@ -15203,6 +15205,36 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
+
+
+@contextmanager
+def _profile_secret_scope(profile_home: Optional[Path] = None):
+    """Expose one profile's config and credentials without mutating process env.
+
+    ``profile_home`` is passed explicitly by worker-thread call paths so their
+    correctness does not depend on threadpool ContextVar propagation.
+    """
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    home = Path(profile_home) if profile_home is not None else get_hermes_home()
+    home_token = (
+        set_hermes_home_override(home) if profile_home is not None else None
+    )
+    secret_token = set_secret_scope(build_profile_secret_scope(home))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 app.include_router(_skills_routes.router)

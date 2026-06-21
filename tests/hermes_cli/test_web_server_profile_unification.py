@@ -7,6 +7,7 @@ reads/writes land in the REQUESTED profile, the dashboard's own profile
 stays untouched, and the chat PTY env is scoped via HERMES_HOME.
 """
 import json
+import os
 
 import pytest
 import yaml
@@ -575,6 +576,73 @@ class TestProfileScopedGateway:
         data = resp.json()
         assert data["gateway_state"] == "stopped"
         assert data["gateway_platforms"] == {}
+
+    def test_status_connected_platforms_scope_profile_secrets(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Regression: the dashboard process starts under the DEFAULT profile,
+        while ``load_gateway_config()`` resolves platform credentials for the
+        requested profile. The status endpoint must install that profile's
+        context-local secret scope for ``get_connected_platforms()``; otherwise
+        the runtime-vs-configured filter silently drops platforms whose tokens
+        live only in the requested profile's ``.env``.
+
+        This test runs the REAL ``load_gateway_config()`` (no monkeypatch) so
+        it exercises the profile secret scope end-to-end.
+        """
+        import hermes_cli.web_server as web_server
+
+        # Default profile: empty .env (no platform tokens at all). This mimics
+        # the real dashboard scenario where the default home has no telegram
+        # token but the worker profile does.
+        default_home = isolated_profiles["default"]
+        (default_home / ".env").write_text("", encoding="utf-8")
+
+        # Worker profile: has a TELEGRAM_BOT_TOKEN in its .env (the token that
+        # makes load_gateway_config() recognise telegram as connected).
+        worker_home = isolated_profiles["worker_beta"]
+        (worker_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=worker-secret-token\n",
+            encoding="utf-8",
+        )
+
+        # Runtime status says telegram is connected on the worker profile.
+        runtime = {
+            "pid": 7777,
+            "gateway_state": "running",
+            "platforms": {"telegram": {"state": "connected"}},
+            "exit_reason": None,
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        # Current upstream routes status liveness through the TTL-cached
+        # wrapper; patch that seam so the test isolates the profile secret scope
+        # rather than probing the host's real gateway process.
+        monkeypatch.setattr(
+            web_server,
+            "get_running_pid_cached",
+            lambda *_args, **_kwargs: 7777,
+        )
+        monkeypatch.setattr(web_server, "read_runtime_status", lambda **_kwargs: runtime)
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+
+        # Make sure no ambient token leaks in from the test runner's env.
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+        resp = client.get("/api/status", params={"profile": "worker_beta"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # Without the secret-scope fix, configured_gateway_platforms would be
+        # empty (default .env has no token) and the filter would drop
+        # telegram from the runtime map → gateway_platforms == {}.
+        assert data["gateway_platforms"] == {
+            "telegram": {"state": "connected"},
+        }
+
+        # The scope must leave process-global environment untouched — the
+        # dashboard must never expose the worker token to concurrent requests.
+        assert os.environ.get("TELEGRAM_BOT_TOKEN") in (None, "")
 
 
 class TestProfileScopedTelegramOnboarding:
