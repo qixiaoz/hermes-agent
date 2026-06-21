@@ -3005,8 +3005,9 @@ def _load_configured_gateway_platforms() -> set[str]:
     """
     from gateway.config import load_gateway_config
 
-    gateway_config = load_gateway_config()
-    return {platform.value for platform in gateway_config.get_connected_platforms()}
+    with _profile_env_bridge_scope():
+        gateway_config = load_gateway_config()
+        return {platform.value for platform in gateway_config.get_connected_platforms()}
 
 
 @app.get("/api/ssh/ownership")
@@ -13641,6 +13642,36 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
+
+
+# Serialize profile env bridging because load_gateway_config() reads
+# platform credentials from process-global os.environ.
+_PROFILE_ENV_BRIDGE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _profile_env_bridge_scope():
+    """Temporarily overlay the active profile .env onto os.environ."""
+    saved: dict[str, str | None] = {}
+    applied: list[str] = []
+    with _PROFILE_ENV_BRIDGE_LOCK:
+        try:
+            env_vars = load_env()
+        except Exception:
+            env_vars = {}
+        for key, value in env_vars.items():
+            saved[key] = os.environ.get(key)
+            os.environ[key] = value
+            applied.append(key)
+        try:
+            yield
+        finally:
+            for key in applied:
+                prior = saved.get(key)
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
 
 
 app.include_router(_skills_routes.router)
