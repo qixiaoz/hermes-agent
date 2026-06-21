@@ -1318,15 +1318,19 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Write-capable connections attempt a TRUNCATE WAL checkpoint first so
+        exiting processes help shrink the WAL file. Read-only connections must
+        not checkpoint: cross-profile dashboard reads use ``mode=ro`` and can
+        otherwise sit in SQLite's busy handler behind the live profile writer,
+        making /api/profiles/sessions block the whole web UI for ~30s.
         """
         with self._lock:
             if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
+                if not self.read_only:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
                 self._conn.close()
                 self._conn = None
 
