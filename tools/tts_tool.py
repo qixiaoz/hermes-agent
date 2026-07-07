@@ -1418,6 +1418,34 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 # ===========================================================================
 # Provider: MiniMax TTS
 # ===========================================================================
+def _minimax_text_to_simplified(text: str, mm_config: Dict[str, Any]) -> str:
+    """Convert Traditional Chinese text to Simplified before MiniMax TTS.
+
+    MiniMax accepts Traditional Chinese, but the Chinese TTS path has proven
+    less stable for zh-Hant glyphs.  Keep the conversion here (rather than in a
+    user command wrapper) so the built-in provider matches the long-standing
+    MiniMax command-provider behaviour.
+    """
+    if mm_config.get("convert_to_simplified", True) is False:
+        return text
+    try:
+        import opencc  # type: ignore
+        converted = opencc.OpenCC("t2s").convert(text)
+    except Exception as exc:
+        logger.warning(
+            "MiniMax TTS opencc t2s unavailable; sending text as-is: %s",
+            exc,
+        )
+        return text
+    if converted != text:
+        logger.info(
+            "MiniMax TTS converted text t2s: %d→%d chars",
+            len(text),
+            len(converted),
+        )
+    return converted
+
+
 def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """
     Generate audio using MiniMax TTS API.
@@ -1436,9 +1464,9 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     """
     import requests
 
-    api_key = (get_env_value("MINIMAX_API_KEY") or "")
+    api_key = (get_env_value("MINIMAX_API_KEY") or get_env_value("MINIMAX_CN_API_KEY") or "")
     if not api_key:
-        raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
+        raise ValueError("MINIMAX_API_KEY or MINIMAX_CN_API_KEY not set. Get one at https://platform.minimax.io/")
 
     mm_config = tts_config.get("minimax", {})
     model = mm_config.get("model", DEFAULT_MINIMAX_MODEL)
@@ -1450,6 +1478,14 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     emotion = mm_config.get("emotion", "neutral")
     sample_rate = mm_config.get("sample_rate", 32000)
     bitrate = mm_config.get("bitrate", 128000)
+    text = _minimax_text_to_simplified(text, mm_config)
+
+    # MiniMax returns MP3 bytes for the t2a_v2/text_to_speech HTTP APIs.  When
+    # callers request an explicit .ogg path (gateway auto-TTS on Telegram), do
+    # not write MP3 bytes into an .ogg filename.  Write a sibling .mp3 first and
+    # convert it to Opus at the requested path.
+    wants_opus_path = output_path.lower().endswith(".ogg")
+    mp3_output_path = output_path.rsplit(".", 1)[0] + ".mp3" if wants_opus_path else output_path
 
     # MiniMax accounts scope TTS requests by GroupId.  When present, the docs
     # show it as a ?GroupId=<id> query param on the t2a_v2 URL.  Accept it
@@ -1516,8 +1552,16 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
             raise RuntimeError("MiniMax TTS returned empty audio data")
 
         audio_bytes = bytes.fromhex(hex_audio)
-        with open(output_path, "wb") as f:
+        with open(mp3_output_path, "wb") as f:
             f.write(audio_bytes)
+        if wants_opus_path:
+            opus_path = _convert_to_opus(mp3_output_path)
+            if opus_path != output_path or not opus_path:
+                raise RuntimeError("MiniMax TTS failed to convert MP3 output to OGG Opus")
+            try:
+                os.unlink(mp3_output_path)
+            except OSError:
+                pass
         return output_path
 
     else:
@@ -1525,8 +1569,16 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
         content_type = response.headers.get("Content-Type", "")
 
         if "audio/" in content_type:
-            with open(output_path, "wb") as f:
+            with open(mp3_output_path, "wb") as f:
                 f.write(response.content)
+            if wants_opus_path:
+                opus_path = _convert_to_opus(mp3_output_path)
+                if opus_path != output_path or not opus_path:
+                    raise RuntimeError("MiniMax TTS failed to convert MP3 output to OGG Opus")
+                try:
+                    os.unlink(mp3_output_path)
+                except OSError:
+                    pass
             return output_path
 
         # Fallback: try parsing as JSON
@@ -2555,6 +2607,11 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
+        elif want_opus and provider == "minimax" and file_str.endswith(".ogg"):
+            # Built-in MiniMax converts explicit .ogg output paths inside the
+            # provider function.  Mark it as voice-compatible here so gateway
+            # auto-TTS and text_to_speech media tags use native voice bubbles.
+            voice_compatible = True
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
