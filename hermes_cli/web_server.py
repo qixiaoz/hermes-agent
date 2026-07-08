@@ -4550,26 +4550,98 @@ async def get_elevenlabs_voices():
     return {"available": True, "voices": voices}
 
 
+_AUDIO_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+
+def _clean_audio_profile(value):
+    """Sanitize a profile name from an untrusted query string.
+
+    Returns the cleaned profile name, or ``None`` when the value is missing,
+    the literal ``"default"``, or contains anything outside ``[A-Za-z0-9_.-]``.
+    The latter guards against path-traversal probes (``"../foo"``,
+    ``"foo/bar"``, ``"foo\\bar"``).
+    """
+    profile = (value or "").strip()
+    if not profile or profile == "default":
+        return None
+    if not _AUDIO_PROFILE_RE.fullmatch(profile):
+        return None
+    return profile
+
+
+def _profile_tts_home(profile):
+    """Resolve a profile name to that profile's Hermes home, if it exists.
+
+    Returns the path ``$HERMES_HOME/profiles/<profile>`` when that directory
+    is on disk and lives under the active Hermes home. Otherwise ``None``.
+    Never raises; any ``OSError`` during path resolution degrades to
+    ``None`` so the endpoint can keep current behavior when the param is
+    missing/invalid.
+    """
+    clean = _clean_audio_profile(profile)
+    if not clean:
+        return None
+
+    from hermes_constants import get_hermes_home
+
+    root = get_hermes_home()
+    profile_home = root / "profiles" / clean
+    try:
+        if not profile_home.is_dir():
+            return None
+        resolved_root = root.resolve(strict=False)
+        resolved_profile = profile_home.resolve(strict=False)
+        if resolved_root not in (resolved_profile, *resolved_profile.parents):
+            return None
+    except OSError:
+        return None
+    return profile_home
+
+
 @app.post("/api/audio/speak")
-async def speak_text(payload: TTSSpeakRequest):
+async def speak_text(payload: TTSSpeakRequest, request: Request):
     """Synthesize speech and return audio as base64 data URL.
 
     Used by the desktop voice-conversation mode to play back assistant
-    responses without exposing the on-disk file path. Reuses the
-    existing TTS provider chain (Edge / OpenAI / ElevenLabs / etc.)
-    configured in ``~/.hermes/config.yaml`` under ``tts.``.
+    responses without exposing the on-disk file path. Reuses the existing
+    TTS provider chain configured in the active Hermes home. When a remote
+    desktop sends ``?profile=<name>``, scope this single request to that
+    profile's Hermes home so profile-level ``tts.`` config is honored.
     """
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
+    profile_home = _profile_tts_home(request.query_params.get("profile"))
+    override_token = None
+
     try:
+        import contextvars
+
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
         from tools.tts_tool import text_to_speech_tool
+
+        if profile_home is not None:
+            override_token = set_hermes_home_override(profile_home)
+
+        # ``run_in_executor`` runs on a worker thread that does NOT inherit
+        # the current ``ContextVar`` values, so the home override would not
+        # reach the TTS tool. ``copy_context`` snapshots the override and
+        # ``ctx.run`` rebinds it for the duration of the tool call.
+        ctx = contextvars.copy_context()
         loop = asyncio.get_running_loop()
-        result_json = await loop.run_in_executor(None, text_to_speech_tool, text)
+        result_json = await loop.run_in_executor(
+            None, lambda: ctx.run(text_to_speech_tool, text)
+        )
     except Exception as exc:
         _log.exception("Desktop voice TTS failed")
         raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
+    finally:
+        if override_token is not None:
+            reset_hermes_home_override(override_token)
 
     try:
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
