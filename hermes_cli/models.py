@@ -535,6 +535,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3-coder-plus",
         "qwen3-coder-next",
         # Third-party models available on coding-intl
+        "glm-5.2",
         "glm-5",
         "glm-4.7",
         "MiniMax-M2.5",
@@ -549,6 +550,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3-coder-plus",
         "qwen3-coder-next",
         "kimi-k2.5",
+        "glm-5.2",
         "glm-5",
         "glm-4.7",
         "MiniMax-M2.5",
