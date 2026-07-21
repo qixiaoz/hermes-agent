@@ -185,6 +185,8 @@ class QQAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
+    _MSG_CACHE_MAX_ENTRIES = 500  # max total entries across all chats
+    _MSG_CACHE_TTL = 3600  # seconds — drop entries older than this
 
     @property
     def _log_tag(self) -> str:
@@ -288,6 +290,13 @@ class QQAdapter(BasePlatformAdapter):
         # box; callers can override with set_interaction_callback(None) or
         # register a custom handler.
         self._interaction_callback = self._default_interaction_dispatch
+
+        # Message content cache: chat_id -> {message_id: content}
+        # Used to resolve reply/quote context when the QQ Bot API does not
+        # support fetching messages by ID (C2C and group scenarios).
+        # Capped at MSG_CACHE_MAX_ENTRIES total; oldest entries evicted first.
+        self._msg_cache: Dict[str, Dict[str, str]] = {}
+        self._msg_cache_order: Dict[str, float] = {}  # key=f"{chat_id}:{msg_id}" -> timestamp
 
     # ------------------------------------------------------------------
     # Properties
@@ -949,6 +958,159 @@ class QQAdapter(BasePlatformAdapter):
         return (time_part ^ rand) % 65536
 
     # ------------------------------------------------------------------
+    # Reply/quote context
+    # ------------------------------------------------------------------
+
+    def _cache_message(self, chat_id: str, msg_id: str, content: str) -> None:
+        """Store a message in the local content cache.
+
+        The cache is bounded by total entry count and TTL.  When the max
+        is reached, the oldest entries (by insertion order) are evicted.
+        """
+        if not msg_id or not content:
+            return
+        key = f"{chat_id}:{msg_id}"
+        now = time.time()
+
+        # Evict stale entries
+        cutoff = now - self._MSG_CACHE_TTL
+        stale_keys = [
+            k for k, ts in self._msg_cache_order.items()
+            if ts < cutoff
+        ]
+        for sk in stale_keys:
+            self._msg_cache_order.pop(sk, None)
+            # Extract chat_id from key and clean up
+            sep = sk.find(":")
+            if sep > 0:
+                cid = sk[:sep]
+                mid = sk[sep + 1:]
+                chat_cache = self._msg_cache.get(cid)
+                if chat_cache:
+                    chat_cache.pop(mid, None)
+
+        # Evict oldest if over capacity
+        while len(self._msg_cache_order) >= self._MSG_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                self._msg_cache_order,
+                key=lambda cache_key: self._msg_cache_order[cache_key],
+            )
+            self._msg_cache_order.pop(oldest_key, None)
+            sep = oldest_key.find(":")
+            if sep > 0:
+                cid = oldest_key[:sep]
+                mid = oldest_key[sep + 1:]
+                chat_cache = self._msg_cache.get(cid)
+                if chat_cache:
+                    chat_cache.pop(mid, None)
+
+        # Store
+        self._msg_cache.setdefault(chat_id, {})[msg_id] = content
+        self._msg_cache_order[key] = now
+
+    async def _extract_reply_context(
+        self, d: Dict[str, Any], chat_type: str, chat_id: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Extract reply context from a QQ Bot message event payload.
+
+        QQ Bot v2 includes a ``message_reference`` object in the WebSocket
+        payload when the user replies to a previous message::
+
+            "message_reference": {
+                "message_id": "<replied-message-id>"
+            }
+
+        The replied content is **not** included inline — unlike Telegram which
+        embeds the full replied message.  This method tries to fetch it via
+        the REST API for guild channels (``GET /v2/channels/{channel_id}/messages/{message_id}``)
+        and logs a warning for C2C/group messages where the equivalent API
+        is not universally available.
+
+        Returns ``(reply_to_message_id, reply_to_text)`` — either may be
+        ``None`` if there is no reply context or the content cannot be fetched.
+        """
+        msg_ref = d.get("message_reference")
+        if not isinstance(msg_ref, dict):
+            return None, None
+
+        ref_msg_id = str(msg_ref.get("message_id", "")).strip()
+        if not ref_msg_id:
+            return None, None
+
+        # 1. Check local message cache first — faster and works for all
+        # chat types (the QQ Bot API only supports GET for guild channels).
+        chat_cache = self._msg_cache.get(chat_id)
+        if chat_cache:
+            cached = chat_cache.get(ref_msg_id)
+            if cached is not None:
+                return ref_msg_id, cached
+
+        # 2. Fallback: try to fetch via REST API (guild channels only)
+        replied_content = None
+        try:
+            if chat_type == "guild" and chat_id:
+                replied_content = await self._fetch_replied_message(
+                    f"/v2/channels/{chat_id}/messages/{ref_msg_id}"
+                )
+            elif chat_type == "c2c":
+                # QQ Bot API does not support GET for C2C messages.
+                # The local cache check above already covered recent messages,
+                # so this is a best-effort probe that will almost certainly
+                # 404 — log at debug and move on.
+                logger.debug(
+                    "[%s] C2C reply fetch unavailable via API for %s; "
+                    "cache miss on msg_id=%s",
+                    self._log_tag, chat_id, ref_msg_id,
+                )
+            elif chat_type == "group":
+                logger.debug(
+                    "[%s] Group reply fetch unavailable via API for %s; "
+                    "cache miss on msg_id=%s",
+                    self._log_tag, chat_id, ref_msg_id,
+                )
+        except Exception:
+            logger.debug(
+                "[%s] Failed to fetch replied message %s for %s/%s",
+                self._log_tag, ref_msg_id, chat_type, chat_id,
+            )
+
+        return ref_msg_id, replied_content
+
+    async def _fetch_replied_message(self, path: str) -> Optional[str]:
+        """Fetch a message's text content from the QQ Bot REST API.
+
+        Returns the ``content`` field of the message, or ``None`` if the
+        endpoint returns an error (e.g. 404 for non-existent messages,
+        403 if the bot lacks permissions, or 405/501 if the endpoint is
+        not implemented for this message type).
+
+        The result is cached in the MessageEvent and never re-fetched.
+        """
+        try:
+            # Use a short timeout — this is a best-effort metadata fetch
+            data = await self._api_request("GET", path, timeout=5.0)
+        except RuntimeError as exc:
+            err_str = str(exc)
+            # Common permanent errors — log at debug level and move on
+            if any(k in err_str for k in ("404", "403", "405", "501", "Not Found")):
+                logger.debug(
+                    "[%s] Replied message fetch not available for %s: %s",
+                    self._log_tag, path, exc,
+                )
+            else:
+                logger.warning(
+                    "[%s] Replied message fetch failed for %s: %s",
+                    self._log_tag, path, exc,
+                )
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        content = str(data.get("content", "")).strip()
+        return content if content else None
+
+    # ------------------------------------------------------------------
     # Inbound message handling
     # ------------------------------------------------------------------
 
@@ -976,6 +1138,12 @@ class QQAdapter(BasePlatformAdapter):
         author = d.get("author") if isinstance(d.get("author"), dict) else {}
 
         # Route by event type
+        msg_ref = d.get("message_reference")
+        if msg_ref is not None:
+            logger.info(
+                "[%s] Found message_reference in payload: %s",
+                self._log_tag, msg_ref,
+            )
         if event_type == "C2C_MESSAGE_CREATE":
             await self._handle_c2c_message(d, msg_id, content, author, timestamp)
         elif event_type in {"GROUP_AT_MESSAGE_CREATE",}:
@@ -1318,6 +1486,11 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[user_openid] = "c2c"
+        self._cache_message(user_openid, msg_id, text)
+        # Extract reply context
+        reply_to_msg_id, reply_to_text_content = await self._extract_reply_context(
+            d, "c2c", user_openid
+        )
         event = MessageEvent(
             source=self.build_source(
                 chat_id=user_openid,
@@ -1330,6 +1503,8 @@ class QQAdapter(BasePlatformAdapter):
             message_id=msg_id,
             media_urls=image_urls,
             media_types=image_media_types,
+            reply_to_message_id=reply_to_msg_id,
+            reply_to_text=reply_to_text_content,
             timestamp=self._parse_qq_timestamp(timestamp),
         )
         await self.handle_message(event)
@@ -1383,6 +1558,11 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[group_openid] = "group"
+        self._cache_message(group_openid, msg_id, text)
+        # Extract reply context
+        reply_to_msg_id, reply_to_text_content = await self._extract_reply_context(
+            d, "group", group_openid
+        )
         event = MessageEvent(
             source=self.build_source(
                 chat_id=group_openid,
@@ -1395,6 +1575,8 @@ class QQAdapter(BasePlatformAdapter):
             message_id=msg_id,
             media_urls=image_urls,
             media_types=image_media_types,
+            reply_to_message_id=reply_to_msg_id,
+            reply_to_text=reply_to_text_content,
             timestamp=self._parse_qq_timestamp(timestamp),
         )
         await self.handle_message(event)
@@ -1457,6 +1639,11 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[channel_id] = "guild"
+        self._cache_message(channel_id, msg_id, text)
+        # Extract reply context
+        reply_to_msg_id, reply_to_text_content = await self._extract_reply_context(
+            d, "guild", channel_id
+        )
         event = MessageEvent(
             source=self.build_source(
                 chat_id=channel_id,
@@ -1470,6 +1657,8 @@ class QQAdapter(BasePlatformAdapter):
             message_id=msg_id,
             media_urls=image_urls,
             media_types=image_media_types,
+            reply_to_message_id=reply_to_msg_id,
+            reply_to_text=reply_to_text_content,
             timestamp=self._parse_qq_timestamp(timestamp),
         )
         await self.handle_message(event)
@@ -1528,6 +1717,11 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[guild_id] = "dm"
+        self._cache_message(guild_id, msg_id, text)
+        # Extract reply context
+        reply_to_msg_id, reply_to_text_content = await self._extract_reply_context(
+            d, "c2c", guild_id
+        )
         event = MessageEvent(
             source=self.build_source(
                 chat_id=guild_id,
@@ -1540,6 +1734,8 @@ class QQAdapter(BasePlatformAdapter):
             message_id=msg_id,
             media_urls=image_urls,
             media_types=image_media_types,
+            reply_to_message_id=reply_to_msg_id,
+            reply_to_text=reply_to_text_content,
             timestamp=self._parse_qq_timestamp(timestamp),
         )
         await self.handle_message(event)
