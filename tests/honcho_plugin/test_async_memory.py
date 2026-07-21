@@ -347,31 +347,38 @@ class TestAsyncWriterRetry:
         mgr.shutdown()
         assert call_count[0] == 2
 
-    def test_drops_after_two_failures(self, make_manager):
+    def test_retries_with_backoff_then_fallback(self, make_manager):
         mgr = make_manager(write_frequency="async")
         mgr._ensure_async_writer()
         sess = _make_session()
         sess.add_message("user", "msg")
-
         call_count = [0]
-        retry_done = threading.Event()
-
+        fallback_done = threading.Event()
         def always_fail(session):
             call_count[0] += 1
-            if call_count[0] >= 2:
-                retry_done.set()
             raise RuntimeError("always broken")
-
         mgr._flush_session = always_fail
-
+        def fake_save_to_fallback(session, fallback_dir):
+            fallback_done.set()
+        mgr._save_to_fallback = fake_save_to_fallback
         with patch("time.sleep"):
             mgr._async_queue.put(sess)
-            assert retry_done.wait(timeout=10), "async writer never retried"
-
+            assert fallback_done.wait(timeout=10), "async writer never reached fallback"
         mgr.shutdown()
-        # Should have tried exactly twice (initial + one retry) and not crashed
-        assert call_count[0] == 2
+        assert call_count[0] >= 6
         assert not mgr._async_thread.is_alive()
+
+    def test_disk_fallback_round_trip(self, tmp_path, make_manager):
+        mgr = make_manager(write_frequency="turn")
+        sess = _make_session(key="gateway:user/1")
+        sess.add_message("user", "persist me")
+        mgr._save_to_fallback(sess, tmp_path)
+        pending = list(tmp_path.glob("pending_*.json"))
+        assert len(pending) == 1
+        with patch.object(mgr, "_flush_session", return_value=True) as flush:
+            assert mgr._drain_fallback_queue(tmp_path) == 1
+        assert flush.call_count == 1
+        assert not pending[0].exists()
 
     def test_retries_when_flush_reports_failure(self, make_manager):
         mgr = make_manager(write_frequency="async")
