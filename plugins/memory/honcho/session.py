@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import queue
 import re
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from plugins.memory.honcho.client import get_honcho_client
+
+try:
+    from hermes_constants import get_hermes_home
+except ImportError:
+    from pathlib import Path as _Path
+    def get_hermes_home() -> _Path:
+        return _Path.home() / ".hermes"
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -151,6 +161,11 @@ class HonchoSessionManager:
                 daemon=True,
             )
             self._async_thread.start()
+            # Drain any pending disk-fallback files from previous gateway crashes
+            try:
+                self._drain_fallback_queue(self._get_fallback_dir())
+            except Exception as e:
+                logger.warning("Honcho fallback startup drain failed (non-fatal): %s", e)
 
     @property
     def honcho(self) -> Honcho:
@@ -458,10 +473,74 @@ class HonchoSessionManager:
                 self._cache[session.key] = session
             return False
 
+    def _get_fallback_dir(self) -> Path:
+        """Get the path to the disk-fallback queue directory."""
+        fallback_dir = get_hermes_home() / "honcho_fallback"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        return fallback_dir
+
+    def _save_to_fallback(self, session: HonchoSession, fallback_dir: Path) -> None:
+        """Serialize unsynced session messages to a disk-fallback file."""
+        unsynced = [m for m in session.messages if not m.get("_synced")]
+        if not unsynced:
+            return
+        payload = {
+            "key": session.key,
+            "user_peer_id": session.user_peer_id,
+            "assistant_peer_id": session.assistant_peer_id,
+            "honcho_session_id": session.honcho_session_id,
+            "messages": [{k: v for k, v in m.items() if k != "_synced"} for m in unsynced],
+        }
+        safe_key = re.sub(r'[^a-zA-Z0-9_-]', '_', session.key)
+        now = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = fallback_dir / f"pending_{safe_key}_{now}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+        logger.info("Saved %d unsynced messages to disk fallback: %s", len(unsynced), path)
+
+    def _drain_fallback_queue(self, fallback_dir: Path) -> int:
+        """Replay pending disk-fallback files, deleting them on success.
+        Returns the number of successfully replayed files."""
+        if not fallback_dir.is_dir():
+            return 0
+        replayed = 0
+        for fpath in sorted(fallback_dir.iterdir()):
+            if not fpath.suffix == ".json" or not fpath.name.startswith("pending_"):
+                continue
+            try:
+                payload = json.loads(fpath.read_text(encoding="utf-8"))
+                sess = HonchoSession(
+                    key=payload["key"],
+                    user_peer_id=payload["user_peer_id"],
+                    assistant_peer_id=payload["assistant_peer_id"],
+                    honcho_session_id=payload["honcho_session_id"],
+                    messages=payload["messages"],
+                )
+                ok = self._flush_session(sess)
+                if ok:
+                    fpath.unlink()
+                    replayed += 1
+                    logger.info("Replayed fallback file: %s", fpath.name)
+                else:
+                    logger.warning("Fallback replay failed (will retry): %s", fpath.name)
+            except Exception as e:
+                logger.warning("Fallback replay error for %s: %s (will retry)", fpath.name, e)
+        return replayed
+
     def _async_writer_loop(self) -> None:
-        """Background daemon thread: drains the async write queue."""
+        """Background daemon thread: drains the async write queue with
+        exponential backoff and disk-fallback persistence."""
+        backoff: int = 2
+        max_backoff: int = 30
+        fallback_dir = self._get_fallback_dir()
+
+        # Drain pending fallback files on thread start
+        self._drain_fallback_queue(fallback_dir)
+
         while True:
             try:
+                # Drain fallback whenever we're idle
+                self._drain_fallback_queue(fallback_dir)
+
                 item = self._async_queue.get(timeout=5)
                 if item is _ASYNC_SHUTDOWN:
                     break
@@ -474,28 +553,50 @@ class HonchoSessionManager:
                     first_error = e
 
                 if success:
+                    backoff = 2
                     continue
 
-                if first_error is not None:
-                    logger.warning("Honcho async write failed, retrying once: %s", first_error)
-                else:
-                    logger.warning("Honcho async write failed, retrying once")
+                # Exponential backoff with retries
+                saved_to_disk = False
+                while not saved_to_disk:
+                    if first_error is not None:
+                        logger.warning(
+                            "Honcho async write failed, retrying in %ds: %s",
+                            backoff, first_error,
+                        )
+                    else:
+                        logger.warning(
+                            "Honcho async write failed, retrying in %ds",
+                            backoff,
+                        )
+                    time.sleep(backoff)
 
-                import time as _time
-                _time.sleep(2)
+                    try:
+                        retry_success = self._flush_session(item)
+                    except Exception as e2:
+                        retry_success = False
+                        first_error = e2
 
-                try:
-                    retry_success = self._flush_session(item)
-                except Exception as e2:
-                    logger.error("Honcho async write retry failed, dropping batch: %s", e2)
-                    continue
+                    if retry_success:
+                        backoff = 2
+                        break
 
-                if not retry_success:
-                    logger.error("Honcho async write retry failed, dropping batch")
+                    if backoff >= max_backoff:
+                        logger.error(
+                            "Honcho unreachable for %ds+, saving to disk fallback: %s",
+                            backoff, item.key,
+                        )
+                        self._save_to_fallback(item, fallback_dir)
+                        backoff = 2
+                        saved_to_disk = True
+                    else:
+                        backoff = min(backoff * 2, max_backoff)
             except queue.Empty:
+                self._drain_fallback_queue(fallback_dir)
                 continue
             except Exception as e:
                 logger.error("Honcho async writer error: %s", e)
+                time.sleep(5)
 
     def save(self, session: HonchoSession) -> None:
         """Save messages to Honcho, respecting write_frequency.
@@ -549,6 +650,11 @@ class HonchoSessionManager:
         """Gracefully shut down the async writer thread."""
         if self._async_queue is not None and self._async_thread is not None:
             self.flush_all()
+            # Try to flush pending disk fallback before exit
+            try:
+                self._drain_fallback_queue(self._get_fallback_dir())
+            except Exception:
+                pass
             self._async_queue.put(_ASYNC_SHUTDOWN)
             self._async_thread.join(timeout=10)
 
