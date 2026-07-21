@@ -2979,10 +2979,22 @@ async def get_status(profile: Optional[str] = None):
     try:
         current_ver, latest_ver = check_config_version()
         # --- Gateway liveness detection ---
+        # Gateway identity files (gateway.pid / gateway_state.json) intentionally
+        # ignore the contextvar HERMES_HOME override (see gateway.status
+        # _get_process_hermes_home). When the dashboard asks about a named
+        # profile via ?profile=, resolve that profile's home and pass explicit
+        # paths — otherwise we always read the *process* home (default) and
+        # report a stale "startup_failed" even while silverwolf/theherta
+        # gateways are healthy.
+        from hermes_constants import get_hermes_home as _get_hermes_home_for_status
+        status_home = Path(_get_hermes_home_for_status())
+        status_pid_path = status_home / "gateway.pid"
+        status_runtime_path = status_home / "gateway_state.json"
+
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = get_running_pid_cached()
+        gateway_pid = get_running_pid_cached(status_pid_path, cleanup_stale=False)
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -3030,7 +3042,7 @@ async def get_status(profile: Optional[str] = None):
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        local_runtime = read_runtime_status()
+        local_runtime = read_runtime_status(status_runtime_path)
         runtime = local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
@@ -3040,7 +3052,9 @@ async def get_status(profile: Optional[str] = None):
         # is display-only. (Running os.kill on a remote PID is both wrong and
         # trips the test live-system guard.)
         if not gateway_running and local_runtime is not None:
-            runtime_pid = get_runtime_status_running_pid(local_runtime)
+            runtime_pid = get_runtime_status_running_pid(
+                local_runtime, expected_home=status_home
+            )
             if runtime_pid is not None:
                 gateway_running = True
                 gateway_pid = runtime_pid
