@@ -5499,11 +5499,18 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
+                            import os as _os
+                            import tempfile as _tempfile
+                            import uuid as _uuid
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            # 用 .ogg 輸出以支援 Telegram 原生語音泡泡
+                            _voice_dir = _os.path.join(_tempfile.gettempdir(), "hermes_voice")
+                            _os.makedirs(_voice_dir, exist_ok=True)
+                            _ogg_path = _os.path.join(_voice_dir, f"tts_adapter_{_uuid.uuid4().hex[:12]}.ogg")
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                                text_to_speech_tool, text=speech_text, output_path=_ogg_path
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
