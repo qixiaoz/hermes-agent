@@ -11,8 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  issues: write
+  contents: read
 
 env:
   TARGET_BRANCH: "main"
@@ -20,9 +19,19 @@ env:
   UPSTREAM_BRANCH: "main"
 
 jobs:
-  maintain:
+  prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    permissions:
+      contents: write
+    outputs:
+      needs_update: ${{ steps.preflight.outputs.needs_update }}
+      original_head: ${{ steps.preflight.outputs.original_head }}
+      upstream_head: ${{ steps.preflight.outputs.upstream_head }}
+      upstream_ref: ${{ steps.preflight.outputs.upstream_ref }}
+      workflow_blob: ${{ steps.preflight.outputs.workflow_blob }}
+      reason: ${{ steps.preflight.outputs.reason }}
+      expected_tree: ${{ steps.package.outputs.expected_tree }}
     steps:
       - name: Checkout maintained branch
         uses: actions/checkout@v5
@@ -36,32 +45,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "fork-maintenance[bot]"
-          git config user.email "fork-maintenance[bot]@users.noreply.github.com"
-          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
-          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
-          git fetch --no-tags origin \
+          /usr/bin/git config user.name "fork-maintenance[bot]"
+          /usr/bin/git config user.email "fork-maintenance[bot]@users.noreply.github.com"
+          /usr/bin/git remote add upstream "$UPSTREAM_URL" 2>/dev/null || \
+            /usr/bin/git remote set-url upstream "$UPSTREAM_URL"
+          /usr/bin/git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          /usr/bin/git fetch --no-tags origin \
             "+refs/heads/maintenance/upstream-base:refs/remotes/origin/maintenance/upstream-base" \
             || true
-          git fetch --no-tags origin \
+          /usr/bin/git fetch --no-tags origin \
             "+refs/heads/maintenance/audited-head:refs/remotes/origin/maintenance/audited-head" \
             || true
 
-          original_head="$(git rev-parse HEAD)"
+          original_head="$(/usr/bin/git rev-parse HEAD)"
           upstream_ref="upstream/$UPSTREAM_BRANCH"
-          upstream_head="$(git rev-parse "$upstream_ref")"
-          workflow_blob="$(git rev-parse "$original_head:.github/workflows/fork-maintenance.yml")"
-          state_upstream="$(git rev-parse --verify refs/remotes/origin/maintenance/upstream-base 2>/dev/null || true)"
-          state_audited="$(git rev-parse --verify refs/remotes/origin/maintenance/audited-head 2>/dev/null || true)"
+          upstream_head="$(/usr/bin/git rev-parse "$upstream_ref")"
+          workflow_blob="$(/usr/bin/git rev-parse "$original_head:.github/workflows/fork-maintenance.yml")"
+          state_upstream="$(/usr/bin/git rev-parse --verify refs/remotes/origin/maintenance/upstream-base 2>/dev/null || true)"
+          state_audited="$(/usr/bin/git rev-parse --verify refs/remotes/origin/maintenance/audited-head 2>/dev/null || true)"
           reasons=()
 
           [[ "$state_upstream" == "$upstream_head" ]] || reasons+=("upstream changed or first run")
           [[ "$state_audited" == "$original_head" ]] || reasons+=("local patch stack changed or first run")
-          git merge-base --is-ancestor "$upstream_ref" HEAD || reasons+=("upstream tip is not an ancestor")
-          if git rev-list --merges "$upstream_ref"..HEAD | grep -q .; then
+          /usr/bin/git merge-base --is-ancestor "$upstream_ref" HEAD || reasons+=("upstream tip is not an ancestor")
+          if /usr/bin/git rev-list --merges "$upstream_ref"..HEAD | grep -q .; then
             reasons+=("merge commits exist above upstream")
           fi
-          if git cherry "$upstream_ref" HEAD | grep -q '^-'; then
+          if /usr/bin/git cherry "$upstream_ref" HEAD | grep -q '^-'; then
             reasons+=("upstream-equivalent patches still exist")
           fi
 
@@ -98,7 +108,8 @@ jobs:
         run: |
           set -euo pipefail
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$remote" "$ORIGINAL_HEAD:refs/heads/maintenance/backup" --force
+          /usr/bin/git -c core.hooksPath=/dev/null push \
+            "$remote" "$ORIGINAL_HEAD:refs/heads/maintenance/backup" --force
 
       - name: Require Codex API credential
         if: steps.preflight.outputs.needs_update == 'true'
@@ -189,7 +200,7 @@ jobs:
               echo "### Codex maintenance report"
               cat codex-output.md
             } >> "$GITHUB_STEP_SUMMARY"
-            rm -f codex-output.md
+            /bin/rm -f codex-output.md
           fi
 
       - name: Verify rewritten history
@@ -201,54 +212,154 @@ jobs:
           WORKFLOW_BLOB: ${{ steps.preflight.outputs.workflow_blob }}
         run: |
           set -euo pipefail
-          [[ "$(git symbolic-ref --short HEAD)" == "$TARGET_BRANCH" ]]
-          git diff --quiet
-          git diff --cached --quiet
-          git merge-base --is-ancestor "$UPSTREAM_REF" HEAD
-          [[ "$(git merge-base HEAD "$UPSTREAM_REF")" == "$UPSTREAM_HEAD" ]]
-          [[ -z "$(git rev-list --merges "$UPSTREAM_REF"..HEAD)" ]]
-          ! git cherry "$UPSTREAM_REF" HEAD | grep -q '^-'
-          [[ "$(git rev-parse "HEAD:.github/workflows/fork-maintenance.yml")" == "$WORKFLOW_BLOB" ]]
+          [[ "$(/usr/bin/git symbolic-ref --short HEAD)" == "$TARGET_BRANCH" ]]
+          /usr/bin/git diff --quiet
+          /usr/bin/git diff --cached --quiet
+          /usr/bin/git merge-base --is-ancestor "$UPSTREAM_REF" HEAD
+          [[ "$(/usr/bin/git merge-base HEAD "$UPSTREAM_REF")" == "$UPSTREAM_HEAD" ]]
+          [[ -z "$(/usr/bin/git rev-list --merges "$UPSTREAM_REF"..HEAD)" ]]
+          ! /usr/bin/git cherry "$UPSTREAM_REF" HEAD | grep -q '^-'
+          [[ "$(/usr/bin/git rev-parse "HEAD:.github/workflows/fork-maintenance.yml")" == "$WORKFLOW_BLOB" ]]
 
           while read -r commit; do
             [[ -n "$commit" ]] || continue
-            parent="$(git rev-parse "$commit^")"
-            if git diff-tree --quiet "$parent" "$commit"; then
+            parent="$(/usr/bin/git rev-parse "$commit^")"
+            if /usr/bin/git diff-tree --quiet "$parent" "$commit"; then
               echo "::error::Empty commit: $commit"
               exit 1
             fi
-            subject="$(git show -s --format=%s "$commit")"
+            subject="$(/usr/bin/git show -s --format=%s "$commit")"
             if [[ -z "$subject" || "$subject" == Merge* || "$subject" == WIP* || "$subject" == fixup\!* || "$subject" == squash\!* ]]; then
               echo "::error::Unclear or temporary commit subject: $subject"
               exit 1
             fi
-          done < <(git rev-list --reverse "$UPSTREAM_REF"..HEAD)
+          done < <(/usr/bin/git rev-list --reverse "$UPSTREAM_REF"..HEAD)
 
-      - name: Publish maintained branch and audit refs
+      - name: Package verified patch stack
+        id: package
         if: steps.preflight.outputs.needs_update == 'true'
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          ORIGINAL_HEAD: ${{ steps.preflight.outputs.original_head }}
-          UPSTREAM_HEAD: ${{ steps.preflight.outputs.upstream_head }}
+          UPSTREAM_REF: ${{ steps.preflight.outputs.upstream_ref }}
         run: |
           set -euo pipefail
-          new_head="$(git rev-parse HEAD)"
+          /usr/bin/git format-patch --binary --stdout "$UPSTREAM_REF"..HEAD > fork-maintenance.mbox
+          expected_tree="$(/usr/bin/git rev-parse 'HEAD^{tree}')"
+          echo "expected_tree=$expected_tree" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified patch stack
+        if: steps.preflight.outputs.needs_update == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-maintenance-patches
+          path: fork-maintenance.mbox
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout original target
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.original_head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified patch stack
+        uses: actions/download-artifact@v4
+        with:
+          name: fork-maintenance-patches
+
+      - name: Reconstruct in a clean runner
+        shell: bash
+        env:
+          UPSTREAM_HEAD: ${{ needs.prepare.outputs.upstream_head }}
+          WORKFLOW_BLOB: ${{ needs.prepare.outputs.workflow_blob }}
+          EXPECTED_TREE: ${{ needs.prepare.outputs.expected_tree }}
+        run: |
+          set -euo pipefail
+          /usr/bin/git remote add upstream "$UPSTREAM_URL" 2>/dev/null || \
+            /usr/bin/git remote set-url upstream "$UPSTREAM_URL"
+          /usr/bin/git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          [[ "$(/usr/bin/git rev-parse "upstream/$UPSTREAM_BRANCH")" == "$UPSTREAM_HEAD" ]]
+
+          /usr/bin/git config --local core.hooksPath /dev/null
+          /usr/bin/git config --local user.name "fork-maintenance[bot]"
+          /usr/bin/git config --local user.email "fork-maintenance[bot]@users.noreply.github.com"
+          /usr/bin/git checkout -B "$TARGET_BRANCH" "$UPSTREAM_HEAD"
+          /usr/bin/git am --3way fork-maintenance.mbox
+
+          /usr/bin/git diff --quiet
+          /usr/bin/git diff --cached --quiet
+          /usr/bin/git merge-base --is-ancestor "$UPSTREAM_HEAD" HEAD
+          [[ "$(/usr/bin/git merge-base HEAD "$UPSTREAM_HEAD")" == "$UPSTREAM_HEAD" ]]
+          [[ -z "$(/usr/bin/git rev-list --merges "$UPSTREAM_HEAD"..HEAD)" ]]
+          ! /usr/bin/git cherry "$UPSTREAM_HEAD" HEAD | grep -q '^-'
+          [[ "$(/usr/bin/git rev-parse 'HEAD^{tree}')" == "$EXPECTED_TREE" ]]
+          [[ "$(/usr/bin/git rev-parse "HEAD:.github/workflows/fork-maintenance.yml")" == "$WORKFLOW_BLOB" ]]
+
+      - name: Publish maintained branch and audit refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_HEAD: ${{ needs.prepare.outputs.original_head }}
+          UPSTREAM_HEAD: ${{ needs.prepare.outputs.upstream_head }}
+        run: |
+          set -euo pipefail
+          new_head="$(/usr/bin/git rev-parse HEAD)"
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$remote" "HEAD:refs/heads/$TARGET_BRANCH" \
+          /usr/bin/git -c core.hooksPath=/dev/null push \
+            "$remote" "HEAD:refs/heads/$TARGET_BRANCH" \
             --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIGINAL_HEAD"
-          git push "$remote" "$UPSTREAM_HEAD:refs/heads/maintenance/upstream-base" --force
-          git push "$remote" "$new_head:refs/heads/maintenance/audited-head" --force
+          /usr/bin/git -c core.hooksPath=/dev/null push \
+            "$remote" "$UPSTREAM_HEAD:refs/heads/maintenance/upstream-base" --force
+          /usr/bin/git -c core.hooksPath=/dev/null push \
+            "$remote" "$new_head:refs/heads/maintenance/audited-head" --force
           echo "Updated \`$TARGET_BRANCH\` to \`$new_head\`." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Open or update maintenance failure issue
-        if: failure() && steps.preflight.outputs.needs_update == 'true'
+  report:
+    needs: [prepare, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Update maintenance status issue
         uses: actions/github-script@v7
         env:
-          PREFLIGHT_REASON: ${{ steps.preflight.outputs.reason }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          NEEDS_UPDATE: ${{ needs.prepare.outputs.needs_update }}
+          PREFLIGHT_REASON: ${{ needs.prepare.outputs.reason }}
         with:
           script: |
             const title = "[fork-maintenance] needs attention";
+            const ok =
+              process.env.PREPARE_RESULT === "success" &&
+              (process.env.NEEDS_UPDATE !== "true" ||
+               process.env.PUBLISH_RESULT === "success");
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const found = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
+            const issues = found.data.items.filter(item => item.title === title);
+
+            if (ok) {
+              for (const item of issues) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: item.number,
+                  state: "closed"
+                });
+              }
+              return;
+            }
+
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
               "The scheduled upstream refresh could not safely publish a rewritten patch stack.",
@@ -259,14 +370,12 @@ jobs:
               "",
               "The previous branch tip is preserved at `maintenance/backup`."
             ].join("\n");
-            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
-            const found = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
-            const issue = found.data.items.find(item => item.title === title);
-            if (issue) {
+
+            if (issues.length) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: issue.number,
+                issue_number: issues[0].number,
                 body
               });
             } else {
@@ -275,22 +384,5 @@ jobs:
                 repo: context.repo.repo,
                 title,
                 body
-              });
-            }
-
-      - name: Close stale maintenance failure issue
-        if: success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const title = "[fork-maintenance] needs attention";
-            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
-            const found = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
-            for (const item of found.data.items.filter(item => item.title === title)) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: item.number,
-                state: "closed"
               });
             }
