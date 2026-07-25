@@ -1,12 +1,12 @@
 name: Hermes conflict resolve
 on:
-  push:
+  pull_request:
     branches: [main]
+    types: [opened, synchronize]
 permissions:
   contents: write
 jobs:
   diagnose:
-    if: github.event.head_commit.message == 'chore: diagnose hermes rebase conflicts'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -23,13 +23,15 @@ jobs:
           set -Eeuo pipefail
           git config user.name 'qixiaoz-maintenance[bot]'
           git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
-          WORKFLOW_HEAD=$(git rev-parse HEAD)
+          HEAD_BRANCH="$GITHUB_HEAD_REF"
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main --no-tags
+          git fetch origin "$HEAD_BRANCH" --no-tags
           ACTUAL_UPSTREAM=$(git rev-parse upstream/main)
+          HEAD_SHA=$(git rev-parse "origin/$HEAD_BRANCH")
           mkdir -p /tmp/conflicts
           if [ "$ACTUAL_UPSTREAM" != "$PINNED_UPSTREAM" ]; then
-            printf 'status=upstream_changed\nworkflow_head=%s\noriginal_head=%s\nupstream_head=%s\n' "$WORKFLOW_HEAD" "$ORIGINAL_HEAD" "$ACTUAL_UPSTREAM" > /tmp/diag.md
+            printf 'status=upstream_changed\nhead_branch=%s\nhead_sha=%s\noriginal_head=%s\nupstream_head=%s\n' "$HEAD_BRANCH" "$HEAD_SHA" "$ORIGINAL_HEAD" "$ACTUAL_UPSTREAM" > /tmp/diag.md
           else
             git checkout -B candidate "$ORIGINAL_HEAD"
             set +e
@@ -40,7 +42,8 @@ jobs:
               git diff --name-only --diff-filter=U > /tmp/conflict-files.txt
               {
                 echo 'status=conflict'
-                echo "workflow_head=$WORKFLOW_HEAD"
+                echo "head_branch=$HEAD_BRANCH"
+                echo "head_sha=$HEAD_SHA"
                 echo "original_head=$ORIGINAL_HEAD"
                 echo "upstream_head=$ACTUAL_UPSTREAM"
                 echo "rebase_head=$(cat .git/REBASE_HEAD 2>/dev/null || true)"
@@ -59,25 +62,18 @@ jobs:
               CANDIDATE=$(git rev-parse HEAD)
               {
                 echo 'status=success'
-                echo "workflow_head=$WORKFLOW_HEAD"
+                echo "head_branch=$HEAD_BRANCH"
+                echo "head_sha=$HEAD_SHA"
                 echo "original_head=$ORIGINAL_HEAD"
                 echo "upstream_head=$ACTUAL_UPSTREAM"
                 echo "candidate_head=$CANDIDATE"
-                echo "custom_count=$(git rev-list --count "$PINNED_UPSTREAM..$CANDIDATE")"
-                echo "merge_count=$(git rev-list --merges "$PINNED_UPSTREAM..$CANDIDATE" | wc -l)"
-                git log --reverse --format='commit=%H subject=%s' "$PINNED_UPSTREAM..$CANDIDATE"
               } > /tmp/diag.md
             fi
           fi
-          git checkout -B diagnostic "$WORKFLOW_HEAD"
+          git checkout -B diagnostic "origin/$HEAD_BRANCH"
           mkdir -p .github/maintenance-diagnostics/hermes-conflicts
           cp /tmp/diag.md .github/maintenance-diagnostics/hermes-rebase.md
           cp -R /tmp/conflicts/. .github/maintenance-diagnostics/hermes-conflicts/ 2>/dev/null || true
           git add .github/maintenance-diagnostics
-          TREE=$(git write-tree)
-          if grep -q '^status=success' /tmp/diag.md; then
-            DIAG=$(printf '%s\n' 'chore: preserve hermes rebase candidate' | git commit-tree "$TREE" -p "$WORKFLOW_HEAD" -p "$CANDIDATE")
-          else
-            DIAG=$(printf '%s\n' 'chore: capture hermes rebase diagnostics' | git commit-tree "$TREE" -p "$WORKFLOW_HEAD")
-          fi
-          git push origin "$DIAG:refs/heads/main"
+          git commit -m 'chore: capture hermes rebase diagnostics'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
