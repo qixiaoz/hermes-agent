@@ -1,0 +1,5 @@
+status=upstream_changed
+head_branch=fork-maintenance/hermes-diagnostic-trigger
+head_sha=2269d831eb3799601d5701df6bac6fd72e724b17
+original_head=e4a71418352300209e6cdc6b32bcfb61ae330972
+upstream_head=199f55805876965fadea0f7a7ef29ae9128602ec
