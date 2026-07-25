@@ -1,5 +1,12 @@
-status=upstream_changed
+status=conflict
 head_branch=fork-maintenance/hermes-diagnostic-trigger
-head_sha=2269d831eb3799601d5701df6bac6fd72e724b17
+head_sha=88624caa890d28903587442d119ffe064f6b02e4
 original_head=e4a71418352300209e6cdc6b32bcfb61ae330972
 upstream_head=199f55805876965fadea0f7a7ef29ae9128602ec
+rebase_head=786c3c253e10ff51c6c8b269960e07433a9ac874
+conflict_files:
+- hermes_cli/web_server.py
+- tests/hermes_cli/test_web_server_profile_unification.py
+git_status:
+UU hermes_cli/web_server.py
+UU tests/hermes_cli/test_web_server_profile_unification.py
