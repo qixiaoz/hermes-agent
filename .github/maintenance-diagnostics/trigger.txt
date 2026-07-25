@@ -1,1 +1,1 @@
-run hermes resolved rebase validation extras
+run hermes resolved rebase semantic test fix
