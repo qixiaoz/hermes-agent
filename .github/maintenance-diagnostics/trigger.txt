@@ -1,1 +1,1 @@
-trigger hermes conflict diagnostics v2
+run hermes resolved rebase v3
