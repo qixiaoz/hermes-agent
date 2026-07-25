@@ -1,1 +1,1 @@
-trigger hermes conflict diagnostics
+trigger hermes conflict diagnostics v2
