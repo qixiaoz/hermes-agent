@@ -379,8 +379,12 @@ class TestProfileScopedGateway:
         # Current upstream routes status liveness through the TTL-cached
         # wrapper; patch that seam so the test isolates the profile env bridge
         # rather than probing the host's real gateway process.
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 7777)
-        monkeypatch.setattr(web_server, "read_runtime_status", lambda: runtime)
+        monkeypatch.setattr(
+            web_server, "get_running_pid_cached", lambda *_args, **_kwargs: 7777
+        )
+        monkeypatch.setattr(
+            web_server, "read_runtime_status", lambda *_args, **_kwargs: runtime
+        )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
 
         # Make sure no ambient token leaks in from the test runner's env.
