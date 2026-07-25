@@ -1,0 +1,83 @@
+name: Hermes conflict resolve
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    if: github.event.head_commit.message == 'chore: diagnose hermes rebase conflicts'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebase and capture conflict
+        shell: bash
+        env:
+          PINNED_UPSTREAM: a979ca2a67a6fe3c08dd97a10ec6131aca913c14
+          ORIGINAL_HEAD: e4a71418352300209e6cdc6b32bcfb61ae330972
+          OLD_BASE: 60ec6a3b8ee147406ecb1ab1bab9cec673995ad7
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          WORKFLOW_HEAD=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --no-tags
+          ACTUAL_UPSTREAM=$(git rev-parse upstream/main)
+          mkdir -p /tmp/conflicts
+          if [ "$ACTUAL_UPSTREAM" != "$PINNED_UPSTREAM" ]; then
+            printf 'status=upstream_changed\nworkflow_head=%s\noriginal_head=%s\nupstream_head=%s\n' "$WORKFLOW_HEAD" "$ORIGINAL_HEAD" "$ACTUAL_UPSTREAM" > /tmp/diag.md
+          else
+            git checkout -B candidate "$ORIGINAL_HEAD"
+            set +e
+            git rebase --onto "$PINNED_UPSTREAM" "$OLD_BASE"
+            RC=$?
+            set -e
+            if [ "$RC" -ne 0 ]; then
+              git diff --name-only --diff-filter=U > /tmp/conflict-files.txt
+              {
+                echo 'status=conflict'
+                echo "workflow_head=$WORKFLOW_HEAD"
+                echo "original_head=$ORIGINAL_HEAD"
+                echo "upstream_head=$ACTUAL_UPSTREAM"
+                echo "rebase_head=$(cat .git/REBASE_HEAD 2>/dev/null || true)"
+                echo 'conflict_files:'
+                sed 's/^/- /' /tmp/conflict-files.txt
+                echo 'git_status:'
+                git status --short
+              } > /tmp/diag.md
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                safe=$(printf '%s' "$f" | sed 's#/#__#g')
+                cp "$f" "/tmp/conflicts/$safe"
+              done < /tmp/conflict-files.txt
+              git rebase --abort || true
+            else
+              CANDIDATE=$(git rev-parse HEAD)
+              {
+                echo 'status=success'
+                echo "workflow_head=$WORKFLOW_HEAD"
+                echo "original_head=$ORIGINAL_HEAD"
+                echo "upstream_head=$ACTUAL_UPSTREAM"
+                echo "candidate_head=$CANDIDATE"
+                echo "custom_count=$(git rev-list --count "$PINNED_UPSTREAM..$CANDIDATE")"
+                echo "merge_count=$(git rev-list --merges "$PINNED_UPSTREAM..$CANDIDATE" | wc -l)"
+                git log --reverse --format='commit=%H subject=%s' "$PINNED_UPSTREAM..$CANDIDATE"
+              } > /tmp/diag.md
+            fi
+          fi
+          git checkout -B diagnostic "$WORKFLOW_HEAD"
+          mkdir -p .github/maintenance-diagnostics/hermes-conflicts
+          cp /tmp/diag.md .github/maintenance-diagnostics/hermes-rebase.md
+          cp -R /tmp/conflicts/. .github/maintenance-diagnostics/hermes-conflicts/ 2>/dev/null || true
+          git add .github/maintenance-diagnostics
+          TREE=$(git write-tree)
+          if grep -q '^status=success' /tmp/diag.md; then
+            DIAG=$(printf '%s\n' 'chore: preserve hermes rebase candidate' | git commit-tree "$TREE" -p "$WORKFLOW_HEAD" -p "$CANDIDATE")
+          else
+            DIAG=$(printf '%s\n' 'chore: capture hermes rebase diagnostics' | git commit-tree "$TREE" -p "$WORKFLOW_HEAD")
+          fi
+          git push origin "$DIAG:refs/heads/main"
