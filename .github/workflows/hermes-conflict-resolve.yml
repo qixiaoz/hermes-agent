@@ -6,31 +6,42 @@ on:
 permissions:
   contents: write
 jobs:
-  diagnose:
+  resolve-and-validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Rebase and capture conflict
+      - name: Rebase, resolve absorbed patch, validate
         shell: bash
         env:
           PINNED_UPSTREAM: 199f55805876965fadea0f7a7ef29ae9128602ec
           ORIGINAL_HEAD: e4a71418352300209e6cdc6b32bcfb61ae330972
           OLD_BASE: 60ec6a3b8ee147406ecb1ab1bab9cec673995ad7
+          ABSORBED_COMMIT: 786c3c253e10ff51c6c8b269960e07433a9ac874
+          EXPECTED_TRIGGER_SUBJECT: chore: run hermes resolved rebase
         run: |
           set -Eeuo pipefail
           git config user.name 'qixiaoz-maintenance[bot]'
           git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          export GIT_EDITOR=true
           HEAD_BRANCH="$GITHUB_HEAD_REF"
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main --no-tags
           git fetch origin "$HEAD_BRANCH" --no-tags
-          ACTUAL_UPSTREAM=$(git rev-parse upstream/main)
           HEAD_SHA=$(git rev-parse "origin/$HEAD_BRANCH")
+          HEAD_SUBJECT=$(git log -1 --format=%s "$HEAD_SHA")
+          if [ "$HEAD_SUBJECT" != "$EXPECTED_TRIGGER_SUBJECT" ]; then
+            echo "Ignoring synchronize event from maintenance output commit: $HEAD_SUBJECT"
+            exit 0
+          fi
+          ACTUAL_UPSTREAM=$(git rev-parse upstream/main)
           mkdir -p /tmp/conflicts
+          STATUS=unknown
+          CANDIDATE=''
           if [ "$ACTUAL_UPSTREAM" != "$PINNED_UPSTREAM" ]; then
+            STATUS=upstream_changed
             printf 'status=upstream_changed\nhead_branch=%s\nhead_sha=%s\noriginal_head=%s\nupstream_head=%s\n' "$HEAD_BRANCH" "$HEAD_SHA" "$ORIGINAL_HEAD" "$ACTUAL_UPSTREAM" > /tmp/diag.md
           else
             git checkout -B candidate "$ORIGINAL_HEAD"
@@ -38,8 +49,21 @@ jobs:
             git rebase --onto "$PINNED_UPSTREAM" "$OLD_BASE"
             RC=$?
             set -e
+            if [ "$RC" -ne 0 ] && [ -d .git/rebase-merge ]; then
+              REBASE_HEAD=$(cat .git/REBASE_HEAD 2>/dev/null || true)
+              CONFLICTS=$(git diff --name-only --diff-filter=U | sort)
+              EXPECTED_CONFLICTS=$(printf '%s\n' 'hermes_cli/web_server.py' 'tests/hermes_cli/test_web_server_profile_unification.py' | sort)
+              if [ "$REBASE_HEAD" = "$ABSORBED_COMMIT" ] && [ "$CONFLICTS" = "$EXPECTED_CONFLICTS" ]; then
+                echo "Dropping absorbed patch $ABSORBED_COMMIT: latest upstream now scopes /api/status PID/runtime reads by profile_dir and expected_home."
+                set +e
+                git rebase --skip
+                RC=$?
+                set -e
+              fi
+            fi
             if [ "$RC" -ne 0 ]; then
-              git diff --name-only --diff-filter=U > /tmp/conflict-files.txt
+              STATUS=conflict
+              git diff --name-only --diff-filter=U > /tmp/conflict-files.txt || true
               {
                 echo 'status=conflict'
                 echo "head_branch=$HEAD_BRANCH"
@@ -60,20 +84,78 @@ jobs:
               git rebase --abort || true
             else
               CANDIDATE=$(git rev-parse HEAD)
-              {
-                echo 'status=success'
-                echo "head_branch=$HEAD_BRANCH"
-                echo "head_sha=$HEAD_SHA"
-                echo "original_head=$ORIGINAL_HEAD"
-                echo "upstream_head=$ACTUAL_UPSTREAM"
-                echo "candidate_head=$CANDIDATE"
-              } > /tmp/diag.md
+              CUSTOM_COUNT=$(git rev-list --count "$PINNED_UPSTREAM..$CANDIDATE")
+              MERGE_COUNT=$(git rev-list --merges "$PINNED_UPSTREAM..$CANDIDATE" | wc -l)
+              test "$CUSTOM_COUNT" = 10
+              test "$MERGE_COUNT" = 0
+
+              python -m pip install --disable-pip-version-check uv
+              uv sync --frozen
+              uv run ruff check \
+                gateway/platforms/base.py \
+                gateway/platforms/qqbot/adapter.py \
+                hermes_cli/models.py \
+                hermes_cli/web_server.py \
+                plugins/memory/honcho/session.py \
+                tools/tts_tool.py \
+                tests/hermes_cli/test_web_server_host_header.py \
+                tests/hermes_cli/test_web_server_profile_unification.py \
+                tests/honcho_plugin/test_async_memory.py \
+                tests/test_web_server_profile_tts.py
+              uv run pytest -q \
+                tests/hermes_cli/test_web_server_host_header.py \
+                tests/hermes_cli/test_web_server_profile_unification.py \
+                tests/honcho_plugin/test_async_memory.py \
+                tests/test_web_server_profile_tts.py
+              npm ci
+              npm run typecheck --workspace apps/desktop
+              npm run build --workspace apps/desktop
+
+              git fetch upstream main --no-tags
+              FINAL_UPSTREAM=$(git rev-parse upstream/main)
+              if [ "$FINAL_UPSTREAM" != "$PINNED_UPSTREAM" ]; then
+                STATUS=upstream_changed_during_validation
+                {
+                  echo 'status=upstream_changed_during_validation'
+                  echo "head_branch=$HEAD_BRANCH"
+                  echo "head_sha=$HEAD_SHA"
+                  echo "original_head=$ORIGINAL_HEAD"
+                  echo "upstream_head=$ACTUAL_UPSTREAM"
+                  echo "final_upstream_head=$FINAL_UPSTREAM"
+                  echo "candidate_head=$CANDIDATE"
+                } > /tmp/diag.md
+              else
+                STATUS=success
+                {
+                  echo 'status=success'
+                  echo "head_branch=$HEAD_BRANCH"
+                  echo "head_sha=$HEAD_SHA"
+                  echo "original_head=$ORIGINAL_HEAD"
+                  echo "upstream_head=$ACTUAL_UPSTREAM"
+                  echo "candidate_head=$CANDIDATE"
+                  echo "custom_count=$CUSTOM_COUNT"
+                  echo "merge_count=$MERGE_COUNT"
+                  echo "dropped_absorbed_commit=$ABSORBED_COMMIT"
+                  echo 'custom_stack:'
+                  git log --reverse --format='- %H %s' "$PINNED_UPSTREAM..$CANDIDATE"
+                  echo 'git_cherry:'
+                  git cherry "$PINNED_UPSTREAM" "$CANDIDATE"
+                  echo 'validation=ruff+targeted_pytest+desktop_typecheck+desktop_build passed'
+                } > /tmp/diag.md
+              fi
             fi
           fi
+
           git checkout -B diagnostic "origin/$HEAD_BRANCH"
+          rm -rf .github/maintenance-diagnostics/hermes-conflicts
           mkdir -p .github/maintenance-diagnostics/hermes-conflicts
           cp /tmp/diag.md .github/maintenance-diagnostics/hermes-rebase.md
           cp -R /tmp/conflicts/. .github/maintenance-diagnostics/hermes-conflicts/ 2>/dev/null || true
           git add .github/maintenance-diagnostics
-          git commit -m 'chore: capture hermes rebase diagnostics'
-          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
+          TREE=$(git write-tree)
+          if [ "$STATUS" = success ]; then
+            DIAG=$(printf '%s\n' 'chore: preserve validated hermes candidate' | git commit-tree "$TREE" -p "$HEAD_SHA" -p "$CANDIDATE")
+          else
+            DIAG=$(printf '%s\n' 'chore: capture hermes maintenance result' | git commit-tree "$TREE" -p "$HEAD_SHA")
+          fi
+          git push origin "$DIAG:refs/heads/$HEAD_BRANCH"
