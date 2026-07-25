@@ -16,7 +16,7 @@ jobs:
       - name: Rebase and capture conflict
         shell: bash
         env:
-          PINNED_UPSTREAM: a979ca2a67a6fe3c08dd97a10ec6131aca913c14
+          PINNED_UPSTREAM: 199f55805876965fadea0f7a7ef29ae9128602ec
           ORIGINAL_HEAD: e4a71418352300209e6cdc6b32bcfb61ae330972
           OLD_BASE: 60ec6a3b8ee147406ecb1ab1bab9cec673995ad7
         run: |
