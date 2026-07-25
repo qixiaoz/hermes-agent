@@ -1,1 +1,1 @@
-run hermes resolved rebase retry
+run hermes resolved rebase diagnostics
