@@ -356,6 +356,7 @@ describe('Hermes REST helpers', () => {
       body: { text: 'Read this aloud' },
       method: 'POST',
       path: '/api/audio/speak',
+      profile: 'default',
       timeoutMs: AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS
     })
   })
