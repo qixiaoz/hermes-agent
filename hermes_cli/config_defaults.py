@@ -1468,7 +1468,7 @@ DEFAULT_CONFIG = {
             "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
         },
         "minimax": {
-            "model": "speech-02-hd",
+            "model": "speech-2.8-hd",
             "voice_id": "English_expressive_narrator",
         },
         "kittentts": {
