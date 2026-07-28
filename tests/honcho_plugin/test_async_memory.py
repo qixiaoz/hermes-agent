@@ -289,6 +289,27 @@ class TestFlushAll:
 # ---------------------------------------------------------------------------
 
 class TestAsyncWriterThread:
+    def test_client_refresh_keeps_profile_config_in_worker_thread(self):
+        """A writer thread must not re-resolve the default Honcho workspace."""
+        mgr = _make_manager(write_frequency="turn")
+        expected_client = MagicMock()
+        seen = []
+
+        def read_client():
+            seen.append(mgr.honcho)
+
+        with patch(
+            "plugins.memory.honcho.session.get_honcho_client",
+            return_value=expected_client,
+        ) as get_client:
+            thread = threading.Thread(target=read_client)
+            thread.start()
+            thread.join(timeout=10)
+
+        assert not thread.is_alive()
+        assert seen == [expected_client]
+        get_client.assert_called_once_with(mgr._config)
+
     def test_thread_started_on_async_mode(self):
         mgr = _make_manager(write_frequency="async")
         assert mgr._async_thread is not None
@@ -480,4 +501,3 @@ class TestPrefetchCacheAccessors:
 
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
-
