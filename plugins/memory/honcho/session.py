@@ -161,8 +161,12 @@ class HonchoSessionManager:
 
         Routes every access through ``get_honcho_client`` (which returns the same
         cached singleton) so a long session can't outlive its 1h access token.
+        Pass the manager's resolved config on every access: Desktop profile
+        backends may run under a request-scoped Hermes home, while async writer
+        threads do not inherit that context. Re-resolving without this config
+        can silently fall back to the default ``hermes`` workspace.
         """
-        self._honcho = get_honcho_client()
+        self._honcho = get_honcho_client(self._config)
         return self._honcho
 
     def _get_or_create_peer(self, peer_id: str) -> Any:
