@@ -876,6 +876,40 @@ class TestGetHonchoClient:
             mock_h3.assert_called_once()
             assert mock_h3.call_args.kwargs["timeout"] == 240.0
 
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("honcho"),
+        reason="honcho SDK not installed"
+    )
+    def test_desktop_profiles_get_workspace_scoped_clients(self):
+        """Alternating profiles in one Desktop backend must never share clients."""
+        hermes_client = MagicMock(name="hermes-client")
+        nahida_client = MagicMock(name="nahida-client")
+        hermes_cfg = HonchoClientConfig(
+            host="hermes",
+            api_key="test-key",
+            workspace_id="hermes",
+            environment="production",
+        )
+        nahida_cfg = HonchoClientConfig(
+            host="hermes_nahida",
+            api_key="test-key",
+            workspace_id="nahida",
+            environment="production",
+        )
+
+        with patch(
+            "honcho.Honcho",
+            side_effect=[hermes_client, nahida_client],
+        ) as mock_honcho:
+            assert get_honcho_client(hermes_cfg) is hermes_client
+            assert get_honcho_client(nahida_cfg) is nahida_client
+            assert get_honcho_client(hermes_cfg) is hermes_client
+            assert get_honcho_client(nahida_cfg) is nahida_client
+
+        assert mock_honcho.call_count == 2
+        assert mock_honcho.call_args_list[0].kwargs["workspace_id"] == "hermes"
+        assert mock_honcho.call_args_list[1].kwargs["workspace_id"] == "nahida"
+
 
 class TestResolveSessionNameGatewayKey:
     """Regression tests for gateway_session_key priority in resolve_session_name.

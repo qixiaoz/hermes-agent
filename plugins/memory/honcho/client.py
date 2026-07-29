@@ -18,6 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -854,8 +855,56 @@ class HonchoClientConfig:
         return self.workspace_id
 
 
-_honcho_client_slot: SingletonSlot = SingletonSlot()
-_cached_timeout: float | None = None
+class _KeyedHonchoClientSlots:
+    """Process-wide Honcho clients isolated by resolved connection scope.
+
+    Desktop can host agents from multiple Hermes profiles in one backend
+    process.  A single ``SingletonSlot`` makes whichever profile initializes
+    Honcho first donate its workspace-bound SDK client to every later profile.
+    Keep the existing build-once concurrency guarantee, but apply it per
+    resolved host/workspace/connection key instead of per process.
+
+    ``key=None`` is retained as a compatibility surface for tests and any
+    out-of-tree code that seeds ``_honcho_client_slot`` directly.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slots: dict[tuple | None, SingletonSlot] = {}
+
+    def _slot(self, key: tuple | None) -> SingletonSlot:
+        with self._lock:
+            slot = self._slots.get(key)
+            if slot is None:
+                slot = SingletonSlot()
+                self._slots[key] = slot
+            return slot
+
+    def get(self, factory, key: tuple | None = None):
+        return self._slot(key).get(factory)
+
+    def peek(self, key: tuple | None = None):
+        with self._lock:
+            slot = self._slots.get(key)
+        return slot.peek() if slot is not None else None
+
+    def reset(self, key: tuple | None = None) -> None:
+        if key is None:
+            with self._lock:
+                slots = list(self._slots.values())
+                self._slots.clear()
+            for slot in slots:
+                slot.reset()
+            return
+
+        with self._lock:
+            slot = self._slots.pop(key, None)
+        if slot is not None:
+            slot.reset()
+
+
+_honcho_client_slot = _KeyedHonchoClientSlots()
+_cached_timeouts: dict[tuple, float] = {}
 # Memo for the honcho.json-derived timeout, keyed on the file's mtime_ns so
 # the staleness check on every get_honcho_client() call costs one stat()
 # instead of a JSON parse. mtime -1 = file absent; (None, None) = not yet
@@ -946,7 +995,11 @@ def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
         logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
 
 
-def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> None:
+def _refresh_cached_oauth(
+    client: "Honcho",
+    config: HonchoClientConfig | None,
+    cache_key: tuple,
+) -> None:
     """Rotate the cached client's Bearer in place when its OAuth token is stale.
 
     If the SDK shape changed and the in-place rotation can't apply, the slot is
@@ -958,38 +1011,51 @@ def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -
         host = config.host if config is not None else resolve_active_host()
         token, refreshed = oauth.ensure_fresh_token(resolve_config_path(), host)
         if refreshed and token and not oauth.apply_token_to_client(client, token):
-            _honcho_client_slot.reset()
+            _honcho_client_slot.reset(cache_key)
+            _cached_timeouts.pop(cache_key, None)
     except Exception:
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
 
 
+def _client_cache_key(config: HonchoClientConfig) -> tuple:
+    """Return a secret-safe key for one workspace-bound SDK client."""
+    api_key_digest = hashlib.sha256((config.api_key or "").encode()).hexdigest()
+    return (
+        config.host,
+        config.workspace_id,
+        config.base_url or "",
+        config.environment,
+        api_key_digest,
+    )
+
+
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
-    """Get or create the Honcho client singleton.
+    """Get or create the Honcho client for one resolved workspace scope.
 
     When no config is provided, attempts to load ~/.honcho/config.json
     first, falling back to environment variables.
 
-    Thread-safe: the client is built exactly once even under concurrent
-    first calls (double-checked locking via ``SingletonSlot``), so racing
-    threads can't each construct a client and leak the loser's connection.
+    Thread-safe: each distinct host/workspace/connection scope is built exactly
+    once even under concurrent first calls.  Different Desktop profiles never
+    share a workspace-bound SDK client.
     """
-    global _cached_timeout
-    cached = _honcho_client_slot.peek()
+    if config is None:
+        config = HonchoClientConfig.from_global_config()
+
+    cache_key = _client_cache_key(config)
+    cached = _honcho_client_slot.peek(cache_key)
     if cached is not None:
         # Detect timeout config changes in long-lived processes (gateway,
         # dashboard).  If the user changed the timeout after the client was
         # built, rebuild with the new value.
         new_timeout = _resolve_timeout_from_sources(config)
-        if new_timeout != _cached_timeout:
-            _honcho_client_slot.reset()
-            _cached_timeout = None
+        if new_timeout != _cached_timeouts.get(cache_key):
+            _honcho_client_slot.reset(cache_key)
+            _cached_timeouts.pop(cache_key, None)
             cached = None
         else:
-            _refresh_cached_oauth(cached, config)
+            _refresh_cached_oauth(cached, config, cache_key)
             return cached
-
-    if config is None:
-        config = HonchoClientConfig.from_global_config()
 
     # Refresh a near-expiry OAuth grant before the first build so the client
     # starts with a live access token rather than 401ing an hour in.
@@ -1097,16 +1163,15 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         if resolved_timeout is not None:
             kwargs["timeout"] = resolved_timeout
 
-        global _cached_timeout
-        _cached_timeout = resolved_timeout
+        _cached_timeouts[cache_key] = resolved_timeout
         return Honcho(**kwargs)
 
-    return _honcho_client_slot.get(_build)
+    return _honcho_client_slot.get(_build, cache_key)
 
 
 def reset_honcho_client() -> None:
-    """Reset the Honcho client singleton (useful for testing)."""
-    global _cached_timeout, _honcho_json_timeout_memo
+    """Reset all cached Honcho clients (useful for testing/reconfiguration)."""
+    global _honcho_json_timeout_memo
     _honcho_client_slot.reset()
-    _cached_timeout = None
+    _cached_timeouts.clear()
     _honcho_json_timeout_memo = (None, None)
