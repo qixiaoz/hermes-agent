@@ -1865,6 +1865,28 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 # ===========================================================================
 # Provider: MiniMax TTS
 # ===========================================================================
+def _minimax_text_to_simplified(text: str, mm_config: Dict[str, Any]) -> str:
+    """Convert Traditional Chinese text to Simplified before MiniMax TTS."""
+    if mm_config.get("convert_to_simplified", True) is False:
+        return text
+    try:
+        import opencc  # type: ignore
+        converted = opencc.OpenCC("t2s").convert(text)
+    except Exception as exc:
+        logger.warning(
+            "MiniMax TTS opencc t2s unavailable; sending text as-is: %s",
+            exc,
+        )
+        return text
+    if converted != text:
+        logger.info(
+            "MiniMax TTS converted text t2s: %d→%d chars",
+            len(text),
+            len(converted),
+        )
+    return converted
+
+
 def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """
     Generate audio using MiniMax TTS API.
@@ -1897,6 +1919,7 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     emotion = mm_config.get("emotion", "neutral")
     sample_rate = mm_config.get("sample_rate", 32000)
     bitrate = mm_config.get("bitrate", 128000)
+    text = _minimax_text_to_simplified(text, mm_config)
 
     # MiniMax accounts scope TTS requests by GroupId.  When present, the docs
     # show it as a ?GroupId=<id> query param on the t2a_v2 URL.  Accept it
