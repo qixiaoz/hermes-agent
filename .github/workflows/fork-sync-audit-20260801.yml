@@ -1,0 +1,140 @@
+name: Fork sync audit 20260801
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/fork-sync-audit-20260801.yml]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  audit-rebase-validate-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REPO: qixiaoz/hermes-agent
+      UPSTREAM: NousResearch/hermes-agent
+      TARGET_BRANCH: main
+      CLEANUP_BRANCH: maintenance-fork-sync-20260801
+    steps:
+      - name: Audit, replay, validate, and publish with lease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          cleanup() {
+            echo "Cleaning temporary branch ${CLEANUP_BRANCH}"
+            gh api -X DELETE "repos/${REPO}/git/refs/heads/${CLEANUP_BRANCH}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          fail() {
+            code="$1"; shift
+            echo "::error::$*"
+            echo "exit_code=${code}"
+            exit "$code"
+          }
+
+          git config --global user.name "qixiaoz-maintenance[bot]"
+          git config --global user.email "qixiaoz-maintenance[bot]@users.noreply.github.com"
+          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git clone --no-tags "$AUTH_URL" repo || fail 10 "clone fork failed"
+          cd repo
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+
+          ORIGINAL_FORK_HEAD="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          UPSTREAM_HEAD_START="$(git ls-remote upstream "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          echo "repository=${REPO}"
+          echo "original_fork_head=${ORIGINAL_FORK_HEAD}"
+          echo "upstream_head_start=${UPSTREAM_HEAD_START}"
+          test -n "$ORIGINAL_FORK_HEAD" || fail 11 "cannot resolve fork HEAD"
+          test -n "$UPSTREAM_HEAD_START" || fail 12 "cannot resolve upstream HEAD"
+
+          git fetch --no-tags origin "${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || fail 13 "fetch fork failed"
+          git fetch --no-tags upstream "${TARGET_BRANCH}:refs/remotes/upstream/${TARGET_BRANCH}" || fail 14 "fetch upstream failed"
+
+          MERGE_BASE="$(git merge-base "origin/${TARGET_BRANCH}" "upstream/${TARGET_BRANCH}")"
+          COUNTS="$(git rev-list --left-right --count "upstream/${TARGET_BRANCH}...origin/${TARGET_BRANCH}")"
+          BEHIND="$(awk '{print $1}' <<<"$COUNTS")"
+          AHEAD="$(awk '{print $2}' <<<"$COUNTS")"
+          echo "merge_base=${MERGE_BASE}"
+          echo "ahead=${AHEAD} behind=${BEHIND}"
+          echo "custom_commits_begin"
+          git log --reverse --format='%H %s' "${MERGE_BASE}..origin/${TARGET_BRANCH}"
+          echo "custom_commits_end"
+          echo "git_cherry_begin"
+          git cherry -v "upstream/${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
+          echo "git_cherry_end"
+          echo "custom_patch_ids_begin"
+          git format-patch --stdout "${MERGE_BASE}..origin/${TARGET_BRANCH}" | git patch-id --stable || true
+          echo "custom_patch_ids_end"
+          echo "upstream_patch_ids_begin"
+          git format-patch --stdout "${MERGE_BASE}..upstream/${TARGET_BRANCH}" | git patch-id --stable || true
+          echo "upstream_patch_ids_end"
+
+          CUSTOM_COUNT="$(git rev-list --count "${MERGE_BASE}..origin/${TARGET_BRANCH}")"
+          git switch -c candidate "origin/${TARGET_BRANCH}" || fail 15 "candidate branch creation failed"
+          set +e
+          git rebase --onto "upstream/${TARGET_BRANCH}" "$MERGE_BASE" candidate
+          REBASE_RC=$?
+          set -e
+          if [ "$REBASE_RC" -ne 0 ]; then
+            echo "rebase_exit_code=${REBASE_RC}"
+            echo "conflict_files_begin"
+            git diff --name-only --diff-filter=U || true
+            echo "conflict_files_end"
+            echo "rebase_status_begin"
+            git status --short || true
+            echo "rebase_status_end"
+            git rebase --abort || true
+            REMOTE_ACTUAL="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+            UPSTREAM_HEAD_END="$(git ls-remote upstream "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+            echo "candidate_head=none"
+            echo "remote_actual_head=${REMOTE_ACTUAL}"
+            echo "upstream_head_end=${UPSTREAM_HEAD_END}"
+            fail 20 "rebase conflict; no publication"
+          fi
+
+          CANDIDATE_HEAD="$(git rev-parse HEAD)"
+          CANDIDATE_COUNT="$(git rev-list --count "upstream/${TARGET_BRANCH}..candidate")"
+          MERGES="$(git rev-list --merges "upstream/${TARGET_BRANCH}..candidate")"
+          echo "candidate_head=${CANDIDATE_HEAD}"
+          echo "candidate_custom_count=${CANDIDATE_COUNT}"
+          test "$CANDIDATE_COUNT" = "$CUSTOM_COUNT" || fail 21 "custom commit count changed"
+          test -z "$MERGES" || fail 22 "candidate contains merge commits"
+
+          python -m pip install --disable-pip-version-check -q uv || fail 30 "install uv failed"
+          if [ -f pyproject.toml ]; then
+            uv sync --all-extras --dev || fail 31 "uv sync failed"
+            uv run pytest -q || fail 32 "pytest failed"
+            uv run ruff check . || fail 33 "Ruff failed"
+            if uv run basedpyright --version >/dev/null 2>&1; then
+              uv run basedpyright || fail 34 "BasedPyright failed"
+            elif uv run pyright --version >/dev/null 2>&1; then
+              uv run pyright || fail 35 "Pyright failed"
+            else
+              fail 36 "no configured Python type checker available"
+            fi
+          fi
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || fail 40 "npm ci failed"
+            npm run typecheck --if-present || fail 41 "TypeScript typecheck failed"
+            npm run build --if-present || fail 42 "TypeScript build failed"
+          elif [ -f package.json ]; then
+            fail 43 "package.json exists without deterministic npm lockfile"
+          fi
+
+          UPSTREAM_HEAD_END="$(git ls-remote upstream "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          REMOTE_ACTUAL="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          echo "upstream_head_end=${UPSTREAM_HEAD_END}"
+          echo "remote_actual_head_before_publish=${REMOTE_ACTUAL}"
+          test "$UPSTREAM_HEAD_END" = "$UPSTREAM_HEAD_START" || fail 50 "upstream changed during validation"
+          test "$REMOTE_ACTUAL" = "$ORIGINAL_FORK_HEAD" || fail 51 "fork changed during validation; lease unsafe"
+
+          git push origin "candidate:${TARGET_BRANCH}" --force-with-lease="refs/heads/${TARGET_BRANCH}:${ORIGINAL_FORK_HEAD}" || fail 52 "lease-protected publish failed"
+          PUBLISHED_HEAD="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          echo "published_head=${PUBLISHED_HEAD}"
+          test "$PUBLISHED_HEAD" = "$CANDIDATE_HEAD" || fail 53 "published HEAD verification failed"
