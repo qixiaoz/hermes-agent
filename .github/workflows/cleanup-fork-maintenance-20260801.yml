@@ -1,0 +1,22 @@
+name: Cleanup fork maintenance branches
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/cleanup-fork-maintenance-20260801.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for branch in maintenance-fork-sync-20260801-pr maintenance-fork-sync-20260801-trigger maintenance-fork-sync-20260801 maintenance-cleanup-20260801; do
+            gh api -X DELETE "repos/qixiaoz/hermes-agent/git/refs/heads/${branch}" >/dev/null 2>&1 || true
+          done
