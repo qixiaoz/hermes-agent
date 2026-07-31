@@ -1,0 +1,17 @@
+name: Cleanup extra maintenance branch
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup-extra:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete accidental trigger branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE repos/qixiaoz/hermes-agent/git/refs/heads/maintenance-fork-sync-20260801-trigger || true
