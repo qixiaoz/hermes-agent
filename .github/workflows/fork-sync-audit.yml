@@ -1,0 +1,164 @@
+name: Fork sync audit
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  audit-rebase-validate:
+    if: github.head_ref == 'maintenance-fork-sync-20260802'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      ORIGINAL_HEAD: 15928a48d266d8811c17a72256b1715b2f41e8a3
+      START_UPSTREAM: 87bc710609f8b89b6e6b4aa418dde8ee30ec6873
+      MERGE_BASE: 2d404942471633d5338a8ff514ea7da24549274f
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fetch and audit history
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main
+          actual_fork=$(git rev-parse origin/main)
+          actual_upstream=$(git rev-parse upstream/main)
+          echo "ORIGINAL_HEAD=$ORIGINAL_HEAD"
+          echo "REMOTE_FORK_HEAD=$actual_fork"
+          echo "START_UPSTREAM=$START_UPSTREAM"
+          echo "ACTUAL_UPSTREAM=$actual_upstream"
+          test "$actual_fork" = "$ORIGINAL_HEAD"
+          test "$actual_upstream" = "$START_UPSTREAM"
+          actual_base=$(git merge-base origin/main upstream/main)
+          echo "MERGE_BASE_ACTUAL=$actual_base"
+          test "$actual_base" = "$MERGE_BASE"
+          echo 'AHEAD_BEHIND:'
+          git rev-list --left-right --count upstream/main...origin/main
+          echo 'CUSTOM_COMMITS:'
+          git log --reverse --format='%H %s' "$MERGE_BASE"..origin/main
+          echo 'GIT_CHERRY:'
+          git cherry -v upstream/main origin/main
+          echo 'CUSTOM_PATCH_IDS:'
+          git log --reverse --format='%H' "$MERGE_BASE"..origin/main | while read sha; do
+            pid=$(git show "$sha" --pretty=format: | git patch-id --stable | awk '{print $1}')
+            printf '%s %s\n' "$sha" "$pid"
+          done
+          echo 'UPSTREAM_PATCH_ID_MATCHES:'
+          tmp_custom=$(mktemp)
+          git log --reverse --format='%H' "$MERGE_BASE"..origin/main | while read sha; do
+            git show "$sha" --pretty=format: | git patch-id --stable | awk -v s="$sha" '{print $1" "s}'
+          done > "$tmp_custom"
+          git log --format='%H' "$MERGE_BASE"..upstream/main | while read sha; do
+            git show "$sha" --pretty=format: | git patch-id --stable | awk -v s="$sha" '{print $1" "s}'
+          done | sort > /tmp/upstream-pids
+          join <(sort "$tmp_custom") /tmp/upstream-pids || true
+          if join <(sort "$tmp_custom") /tmp/upstream-pids | grep -q .; then
+            echo 'ERROR: one or more custom patches have upstream patch-id matches'
+            exit 21
+          fi
+
+      - name: Rebase exact patch stack
+        run: |
+          set -euo pipefail
+          git config user.name 'fork-maintenance-bot'
+          git config user.email 'fork-maintenance-bot@users.noreply.github.com'
+          git switch --detach "$ORIGINAL_HEAD"
+          git switch -c candidate
+          git rebase --onto upstream/main "$MERGE_BASE" candidate
+          candidate=$(git rev-parse HEAD)
+          echo "CANDIDATE_HEAD=$candidate" | tee -a "$GITHUB_ENV"
+          echo 'CANDIDATE_COMMITS:'
+          git log --reverse --format='%H %s' upstream/main..candidate
+          test "$(git rev-list --count upstream/main..candidate)" -eq 10
+          test -z "$(git rev-list --merges upstream/main..candidate)"
+          test "$(git merge-base candidate upstream/main)" = "$(git rev-parse upstream/main)"
+
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            **/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          uv sync --all-extras --dev --python 3.11
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Python type check
+        run: |
+          set -euo pipefail
+          if uv run basedpyright --version >/dev/null 2>&1; then
+            uv run basedpyright
+          elif uv run pyright --version >/dev/null 2>&1; then
+            uv run pyright
+          elif uv run ty --version >/dev/null 2>&1; then
+            uv run ty check
+          else
+            echo 'No configured Python type checker available'
+            exit 41
+          fi
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: TypeScript typecheck and build
+        run: |
+          set -euo pipefail
+          mapfile -t locks < <(find . -name package-lock.json -not -path './node_modules/*' -print | sort)
+          if [ "${#locks[@]}" -eq 0 ]; then
+            echo 'No npm package-lock.json found; no TypeScript workspace to validate.'
+            exit 0
+          fi
+          for lock in "${locks[@]}"; do
+            dir=$(dirname "$lock")
+            echo "Validating npm workspace: $dir"
+            pushd "$dir"
+            npm ci
+            node -e "const p=require('./package.json'); if(p.scripts?.typecheck) process.exit(0); process.exit(2)" && npm run typecheck || rc=$?
+            if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 2 ]; then exit "$rc"; fi
+            unset rc
+            node -e "const p=require('./package.json'); if(p.scripts?.build) process.exit(0); process.exit(2)" && npm run build || rc=$?
+            if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 2 ]; then exit "$rc"; fi
+            unset rc
+            popd
+          done
+
+      - name: Reconfirm upstream and publish with lease
+        run: |
+          set -euo pipefail
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main
+          end_upstream=$(git rev-parse upstream/main)
+          remote_fork=$(git rev-parse origin/main)
+          echo "END_UPSTREAM=$end_upstream"
+          echo "REMOTE_FORK_BEFORE_PUBLISH=$remote_fork"
+          test "$end_upstream" = "$START_UPSTREAM"
+          test "$remote_fork" = "$ORIGINAL_HEAD"
+          git push origin "candidate:refs/heads/main" --force-with-lease="refs/heads/main:$ORIGINAL_HEAD"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$CANDIDATE_HEAD"
+          echo "PUBLISHED_HEAD=$CANDIDATE_HEAD"
+
+      - name: Cleanup temporary branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE repos/${{ github.repository }}/git/refs/heads/maintenance-fork-sync-20260802 || true
