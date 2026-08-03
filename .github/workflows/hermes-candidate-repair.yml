@@ -1,73 +1,34 @@
-name: Publish validated Hermes candidate
+name: Cleanup Hermes maintenance refs
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize]
 permissions:
   contents: write
-  actions: read
 
 env:
-  CANDIDATE_SHA: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  PUBLISHED_MAIN: 48401e2dfdfd060eadbcfecd479c98aafee14482
   PINNED_UPSTREAM: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
-  ORIGINAL_HEAD: 15928a48d266d8811c17a72256b1715b2f41e8a3
-  CANDIDATE_BRANCH: fork-maintenance/hermes-manual-20260803
-  VALIDATION_BRANCH: fork-maintenance/hermes-validation-20260803
-  VALIDATION_BRANCH_HEAD: 0a5bca0ea07fe16bc639a4374e0546b9ce62b5cd
-  VALIDATION_RUN: "30780003871"
 
 jobs:
-  publish:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.CANDIDATE_SHA }}
+          ref: ${{ env.PUBLISHED_MAIN }}
           fetch-depth: 0
-      - name: Verify validation evidence and publish with exact lease
+      - name: Verify final state and delete temporary branches
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          git config user.name 'qixiaoz-maintenance[bot]'
-          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
-
-          run_json=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATION_RUN")
-          test "$(jq -r .name <<<"$run_json")" = "Hermes final candidate validation"
-          test "$(jq -r .status <<<"$run_json")" = "completed"
-          test "$(jq -r .conclusion <<<"$run_json")" = "success"
-
-          validation_ref=$(git ls-remote origin "refs/heads/$VALIDATION_BRANCH" | awk '{print $1}')
-          candidate_ref=$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | awk '{print $1}')
-          main_ref=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-          test "$validation_ref" = "$VALIDATION_BRANCH_HEAD"
-          test "$candidate_ref" = "$CANDIDATE_SHA"
-          test "$main_ref" = "$ORIGINAL_HEAD"
-
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$PUBLISHED_MAIN"
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch upstream main --no-tags
-          final_upstream=$(git rev-parse upstream/main)
-          test "$final_upstream" = "$PINNED_UPSTREAM"
-
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git merge-base "$PINNED_UPSTREAM" "$CANDIDATE_SHA")" = "$PINNED_UPSTREAM"
-          test "$(git rev-list --count "$PINNED_UPSTREAM..$CANDIDATE_SHA")" = 10
-          test "$(git rev-list --merges "$PINNED_UPSTREAM..$CANDIDATE_SHA" | wc -l)" = 0
-          git diff --check "$PINNED_UPSTREAM..$CANDIDATE_SHA"
-
-          echo "Publishing $CANDIDATE_SHA over $ORIGINAL_HEAD with exact force-with-lease"
-          git push --force-with-lease="refs/heads/main:$ORIGINAL_HEAD" \
-            origin "$CANDIDATE_SHA:refs/heads/main"
-
-          published=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-          upstream_after=$(git ls-remote upstream refs/heads/main | awk '{print $1}')
-          test "$published" = "$CANDIDATE_SHA"
-          test "$upstream_after" = "$PINNED_UPSTREAM"
-          echo "PUBLISHED_MAIN=$published"
-          echo "UPSTREAM_AFTER=$upstream_after"
+          test "$(git ls-remote upstream refs/heads/main | awk '{print $1}')" = "$PINNED_UPSTREAM"
+          git push origin --delete \
+            fork-maintenance/hermes-manual-20260803 \
+            fork-maintenance/hermes-validation-20260803 \
+            fork-maintenance/hermes-repair-20260803
+          test -z "$(git ls-remote origin 'refs/heads/fork-maintenance/hermes-*')"
+          echo "Temporary Hermes maintenance branches removed"
