@@ -1,0 +1,35 @@
+name: Cleanup completed Hermes maintenance
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+permissions:
+  contents: write
+
+env:
+  PUBLISHED_MAIN: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  PINNED_UPSTREAM: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PUBLISHED_MAIN }}
+          fetch-depth: 0
+      - name: Verify final refs and delete maintenance branches
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$PUBLISHED_MAIN"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          test "$(git ls-remote upstream refs/heads/main | awk '{print $1}')" = "$PINNED_UPSTREAM"
+          git push origin --delete \
+            fork-maintenance/hermes-manual-20260803 \
+            fork-maintenance/hermes-validation-20260803 \
+            fork-maintenance/hermes-repair-20260803 \
+            fork-maintenance/hermes-cleanup-20260803
+          test -z "$(git ls-remote origin 'refs/heads/fork-maintenance/hermes-*')"
+          echo "All temporary Hermes maintenance branches removed"
