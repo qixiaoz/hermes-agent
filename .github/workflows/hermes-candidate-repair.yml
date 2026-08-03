@@ -1,0 +1,113 @@
+name: Repair Hermes candidate stack
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+permissions:
+  contents: write
+
+env:
+  OLD_CANDIDATE: b22e3335aa0717d6c5b285b116cde9bfde075e4c
+  PINNED_UPSTREAM: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
+  ORIGINAL_HEAD: 15928a48d266d8811c17a72256b1715b2f41e8a3
+  CANDIDATE_BRANCH: fork-maintenance/hermes-manual-20260803
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rewrite QQBot cache commit in place
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --no-tags
+
+          test "$(git rev-parse upstream/main)" = "$PINNED_UPSTREAM"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          test "$(git ls-remote origin refs/heads/$CANDIDATE_BRANCH | awk '{print $1}')" = "$OLD_CANDIDATE"
+
+          mapfile -t commits < <(git rev-list --reverse "$PINNED_UPSTREAM..$OLD_CANDIDATE")
+          test "${#commits[@]}" = 10
+          printf 'OLD %s\n' "${commits[@]}"
+
+          git checkout -B repaired "$PINNED_UPSTREAM"
+          for i in "${!commits[@]}"; do
+            commit="${commits[$i]}"
+            git cherry-pick "$commit"
+            if [ "$i" = 1 ]; then
+              python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("gateway/platforms/qqbot/adapter.py")
+          text = path.read_text(encoding="utf-8")
+          old = "            oldest_key = min(self._msg_cache_order, key=self._msg_cache_order.get)"
+          new = """            oldest_key = min(
+                          self._msg_cache_order,
+                          key=lambda cache_key: self._msg_cache_order[cache_key],
+                      )"""
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one cache eviction expression, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+              git add gateway/platforms/qqbot/adapter.py
+              git commit --amend --no-edit
+            fi
+          done
+
+          NEW_CANDIDATE=$(git rev-parse HEAD)
+          echo "NEW_CANDIDATE=$NEW_CANDIDATE"
+          test "$(git rev-list --count "$PINNED_UPSTREAM..$NEW_CANDIDATE")" = 10
+          test "$(git rev-list --merges "$PINNED_UPSTREAM..$NEW_CANDIDATE" | wc -l)" = 0
+
+          cat > /tmp/expected-subjects <<'EOF'
+          fix(honcho): persist async writes with retry fallback
+          fix(qqbot): bound reply-context message cache
+          fix(dashboard): allow configured loopback proxy hosts
+          fix(dashboard): bridge requested profile's .env when computing connected platforms
+          feat(models): add glm-5.2 to alibaba + alibaba-coding-plan
+          fix(models): restore qwen3.7-max to alibaba-coding-plan
+          test(dashboard): adapt profile-env status stubs to scoped reads
+          fix(honcho): preserve profile config in async writer
+          fix(tts): use speech-2.8-hd as MiniMax default
+          fix(tts): preserve MiniMax Traditional Chinese normalization
+          EOF
+          git log --reverse --format='%s' "$PINNED_UPSTREAM..$NEW_CANDIDATE" > /tmp/actual-subjects
+          diff -u /tmp/expected-subjects /tmp/actual-subjects
+          git diff --check "$PINNED_UPSTREAM..$NEW_CANDIDATE"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("gateway/platforms/qqbot/adapter.py").read_text(encoding="utf-8")
+          expected = """            oldest_key = min(
+                          self._msg_cache_order,
+                          key=lambda cache_key: self._msg_cache_order[cache_key],
+                      )"""
+          assert text.count(expected) == 1
+          PY
+
+          echo '=== range diff old candidate -> repaired candidate ==='
+          git range-diff "$PINNED_UPSTREAM..$OLD_CANDIDATE" "$PINNED_UPSTREAM..$NEW_CANDIDATE"
+          echo '=== repaired patch IDs ==='
+          git log --reverse --format='%H' "$PINNED_UPSTREAM..$NEW_CANDIDATE" | while read -r commit; do
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$(git show -s --format=%s "$commit")"
+          done
+
+          # Upload objects and attempt an exact-lease ref update. The repository
+          # token may be denied because upstream changed workflow files; the
+          # new SHA is printed above so the connected GitHub app can complete
+          # the ref move without adding any maintenance commit to the candidate.
+          set +e
+          git push --force-with-lease="refs/heads/$CANDIDATE_BRANCH:$OLD_CANDIDATE" \
+            origin "$NEW_CANDIDATE:refs/heads/$CANDIDATE_BRANCH"
+          push_rc=$?
+          set -e
+          echo "PUSH_EXIT_CODE=$push_rc"
+          exit "$push_rc"
