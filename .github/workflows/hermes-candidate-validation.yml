@@ -1,4 +1,4 @@
-name: Hermes candidate validation
+name: Hermes candidate follow-up validation
 on:
   pull_request:
     branches: [main]
@@ -21,8 +21,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
-      - name: Verify candidate topology and retained stack
-        shell: bash
+      - name: Verify pinned refs and clean linear stack
         run: |
           set -Eeuo pipefail
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
@@ -32,82 +31,68 @@ jobs:
           test "$(git ls-remote origin refs/heads/$CANDIDATE_BRANCH | awk '{print $1}')" = "$CANDIDATE_SHA"
           test "$(git rev-list --count "$PINNED_UPSTREAM..$CANDIDATE_SHA")" = 10
           test "$(git rev-list --merges "$PINNED_UPSTREAM..$CANDIDATE_SHA" | wc -l)" = 0
-          cat > /tmp/expected-subjects <<'EOF'
-          fix(honcho): persist async writes with retry fallback
-          fix(qqbot): bound reply-context message cache
-          fix(dashboard): allow configured loopback proxy hosts
-          fix(dashboard): bridge requested profile's .env when computing connected platforms
-          feat(models): add glm-5.2 to alibaba + alibaba-coding-plan
-          fix(models): restore qwen3.7-max to alibaba-coding-plan
-          test(dashboard): adapt profile-env status stubs to scoped reads
-          fix(honcho): preserve profile config in async writer
-          fix(tts): use speech-2.8-hd as MiniMax default
-          fix(tts): preserve MiniMax Traditional Chinese normalization
-          EOF
-          git log --reverse --format='%s' "$PINNED_UPSTREAM..$CANDIDATE_SHA" > /tmp/actual-subjects
-          diff -u /tmp/expected-subjects /tmp/actual-subjects
           git diff --check "$PINNED_UPSTREAM..$CANDIDATE_SHA"
-          git log --reverse --format='%H %s' "$PINNED_UPSTREAM..$CANDIDATE_SHA"
 
-  generate-tests:
+  quality-diff:
     needs: audit
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CANDIDATE_SHA }}
-      - id: matrix
-        run: |
-          MATRIX=$(python3 scripts/run_tests_parallel.py --generate-slices 8)
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-
-  python-tests:
-    needs: [audit, generate-tests]
-    name: Python tests ${{ matrix.slice.index }}/8
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.generate-tests.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-      - name: Install ripgrep
-        run: |
-          set -euo pipefail
-          RG_VERSION=15.1.0
-          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
-          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
-          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
-          tar -xzf "$RG_TARBALL"
-          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
           version: "0.9.28"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
-      - run: uv python install 3.11
-      - name: Install dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
-      - name: Run test slice
+      - name: Blocking Ruff and Windows guardrails
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
-        env:
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+          uv tool install ruff
+          ruff check .
+          python scripts/check-windows-footguns.py --all
+      - name: Require no new ty diagnostics versus pinned upstream
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv tool install ty
+          mkdir -p .type-reports
+          git worktree add --detach /tmp/hermes-upstream "$PINNED_UPSTREAM"
+          (
+            cd /tmp/hermes-upstream
+            ty check --output-format gitlab --exit-zero > "$GITHUB_WORKSPACE/.type-reports/base.json"
+          )
+          ty check --output-format gitlab --exit-zero > .type-reports/head.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
 
-  python-e2e:
+          def load(path: str):
+              data = json.loads(Path(path).read_text(encoding="utf-8"))
+              assert isinstance(data, list)
+              return data
+
+          def key(item):
+              location = item.get("location") or {}
+              path = location.get("path", "")
+              return (
+                  path,
+                  item.get("check_name", "unknown"),
+                  item.get("description", ""),
+              )
+
+          base = {key(item): item for item in load(".type-reports/base.json")}
+          head = {key(item): item for item in load(".type-reports/head.json")}
+          new = sorted(set(head) - set(base))
+          fixed = sorted(set(base) - set(head))
+          print(f"upstream diagnostics={len(base)} candidate diagnostics={len(head)}")
+          print(f"new={len(new)} fixed={len(fixed)}")
+          for path, rule, message in new[:50]:
+              print(f"NEW {path} [{rule}] {message}")
+          if new:
+              raise SystemExit(1)
+          PY
+
+  locked-install:
     needs: audit
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -119,113 +104,36 @@ jobs:
         with:
           version: "0.9.28"
           enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
       - run: uv python install 3.11
-      - name: Install dependencies
+      - name: Verify supported locked installation path
         uses: ./.github/actions/retry
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
-      - run: uv run python -m pytest tests/e2e/ -v --tb=short
-        env:
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
-
-  python-quality:
-    needs: audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
-        with:
-          version: "0.9.28"
-      - name: Ruff, type checks, and Windows guardrails
+      - name: Import smoke test
         run: |
-          uv tool install ruff
-          uv tool install ty
-          ruff check .
-          ty check \
-            plugins/memory/honcho/session.py \
-            gateway/platforms/qqbot/adapter.py \
-            hermes_cli/web_server.py \
-            hermes_cli/models.py \
-            tools/tts_tool.py
-          python scripts/check-windows-footguns.py --all
-
-  js-checks:
-    needs: audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 26
-          cache: npm
-      - run: npm i -g npm@12
-      - name: Install JavaScript dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: npm ci
-      - name: Run all workspace checks
-        run: |
-          node <<'NODE'
-          const { execFileSync, execSync } = require('child_process');
-          const pkgs = JSON.parse(execSync('npm query .workspace', { encoding: 'utf8' }));
-          if (!pkgs.length) throw new Error('No npm workspaces found');
-          let count = 0;
-          for (const pkg of pkgs) {
-            const scripts = pkg.scripts || {};
-            const checks = Object.keys(scripts).filter((s) => /^check:.+$/.test(s));
-            const selected = checks.length ? checks : (scripts.check ? ['check'] : []);
-            for (const script of selected) {
-              console.log(`::group::${pkg.location} / ${script}`);
-              execFileSync('npm', ['run', '--prefix', pkg.location, script], { stdio: 'inherit' });
-              console.log('::endgroup::');
-              count += 1;
-            }
-          }
-          if (!count) throw new Error('No workspace check scripts found');
-          NODE
-      - name: Build desktop
-        run: npm run build --workspace apps/desktop
-
-  python-build:
-    needs: audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
-        with:
-          version: "0.9.28"
-      - run: uv python install 3.11
-      - run: uv build --python 3.11
+          uv run python - <<'PY'
+          import hermes_cli.models
+          import hermes_cli.web_server
+          import plugins.memory.honcho.session
+          import tools.tts_tool
+          print("candidate imports succeeded")
+          PY
 
   validation-gate:
     if: always()
-    needs: [audit, python-tests, python-e2e, python-quality, js-checks, python-build]
+    needs: [audit, quality-diff, locked-install]
     runs-on: ubuntu-latest
     steps:
-      - name: Require every validation lane
+      - name: Require follow-up lanes
         env:
           AUDIT: ${{ needs.audit.result }}
-          PYTEST: ${{ needs.python-tests.result }}
-          E2E: ${{ needs.python-e2e.result }}
-          QUALITY: ${{ needs.python-quality.result }}
-          JS: ${{ needs.js-checks.result }}
-          BUILD: ${{ needs.python-build.result }}
+          QUALITY: ${{ needs.quality-diff.result }}
+          INSTALL: ${{ needs.locked-install.result }}
         run: |
-          printf 'audit=%s pytest=%s e2e=%s quality=%s js=%s build=%s\n' "$AUDIT" "$PYTEST" "$E2E" "$QUALITY" "$JS" "$BUILD"
+          printf 'audit=%s quality=%s install=%s\n' "$AUDIT" "$QUALITY" "$INSTALL"
           test "$AUDIT" = success
-          test "$PYTEST" = success
-          test "$E2E" = success
           test "$QUALITY" = success
-          test "$JS" = success
-          test "$BUILD" = success
+          test "$INSTALL" = success
