@@ -1,0 +1,174 @@
+name: Agent Hermes R2 validate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: 3b8ddcffb694af0c1f8d9090693badb63b647162
+  UPSTREAM_SHA: 743dc94ab90adb0529bb233b8498c6fd6ee0e020
+  ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  CUSTOM_COUNT: '10'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out exact clean candidate
+        uses: actions/checkout@v4
+        with:
+          ref: 3b8ddcffb694af0c1f8d9090693badb63b647162
+          fetch-depth: 0
+
+      - name: Verify topology and custom scope
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git merge-base HEAD upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count upstream/main..HEAD)" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges --count upstream/main..HEAD)" = 0
+          test ! -e .github/workflows/agent-hermes-r2-replay.yml
+          test ! -e .github/workflows/agent-hermes-r2-validate.yml
+          git diff --check upstream/main..HEAD
+          git diff --name-only upstream/main..HEAD | tee /tmp/custom-touched-files
+          git log --oneline --reverse upstream/main..HEAD
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: '0.9.28'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Create identical locked environments
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for n in 1 2 3; do uv python install 3.11 && break || sleep $((n * 5)); done
+          git worktree add --detach /tmp/hermes-upstream "$UPSTREAM_SHA"
+          git worktree add --detach /tmp/hermes-original "$ORIGINAL_HEAD"
+          args=(--locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web)
+          (cd /tmp/hermes-upstream && uv sync "${args[@]}")
+          (cd /tmp/hermes-original && uv sync "${args[@]}")
+          uv sync "${args[@]}"
+
+      - name: Native Ruff and Windows guardrails
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run ruff check .
+          uv run python scripts/check-windows-footguns.py --all
+
+      - name: Three-way type provenance gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv tool install 'ty==0.0.66'
+          (cd /tmp/hermes-upstream && ty check --output-format gitlab --exit-zero > /tmp/type-upstream.json)
+          (cd /tmp/hermes-original && ty check --output-format gitlab --exit-zero > /tmp/type-original.json)
+          (cd "$GITHUB_WORKSPACE" && ty check --output-format gitlab --exit-zero > /tmp/type-candidate.json)
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          roots = ['/tmp/hermes-upstream/', '/tmp/hermes-original/', str(Path.cwd()) + '/']
+          def load(path):
+              data = json.loads(Path(path).read_text())
+              out = set()
+              for item in data:
+                  loc = item.get('location') or {}
+                  filename = str(loc.get('path', '')).replace('\\', '/')
+                  for root in roots:
+                      filename = filename.replace(root, '')
+                  out.add((filename, item.get('check_name', ''), item.get('description', '')))
+              return out
+
+          upstream = load('/tmp/type-upstream.json')
+          original = load('/tmp/type-original.json')
+          candidate = load('/tmp/type-candidate.json')
+          new = sorted(candidate - (upstream | original))
+          touched = set(Path('/tmp/custom-touched-files').read_text().splitlines())
+          touched_new = [x for x in new if x[0] in touched]
+          print(f'upstream={len(upstream)} original={len(original)} candidate={len(candidate)}')
+          print(f'new-after-replay={len(new)} touched-new={len(touched_new)}')
+          for item in new[:200]:
+              print('NEW', item)
+          if new or touched_new:
+              raise SystemExit(1)
+          PY
+
+      - name: Full Python test suite
+        id: python_tests
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+          HERMES_TEST_WORKERS: '4'
+        run: |
+          set -o pipefail
+          source .venv/bin/activate
+          python scripts/run_tests_parallel.py -q --tb=short 2>&1 | tee /tmp/python-tests.log
+
+      - name: End-to-end tests
+        id: e2e_tests
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -o pipefail
+          source .venv/bin/activate
+          python -m pytest tests/e2e/ -v --tb=short 2>&1 | tee /tmp/e2e-tests.log
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.0'
+          cache: npm
+
+      - name: JavaScript TypeScript and desktop build
+        id: js_checks
+        shell: bash
+        run: |
+          set -o pipefail
+          npm install -g npm@12
+          npm ci 2>&1 | tee /tmp/npm-ci.log
+          npm run check 2>&1 | tee /tmp/npm-check.log
+          npm run build --workspace apps/desktop 2>&1 | tee /tmp/desktop-build.log
+
+      - name: Recheck exact refs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          echo "VALIDATED_CANDIDATE=$CANDIDATE_SHA"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-r2-validation-diagnostics
+          path: |
+            /tmp/python-tests.log
+            /tmp/e2e-tests.log
+            /tmp/npm-ci.log
+            /tmp/npm-check.log
+            /tmp/desktop-build.log
+            /tmp/type-upstream.json
+            /tmp/type-original.json
+            /tmp/type-candidate.json
+          if-no-files-found: ignore
