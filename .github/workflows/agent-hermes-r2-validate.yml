@@ -1,192 +1,41 @@
-name: Agent Hermes atomic update
+name: Agent clean Hermes maintenance refs
 
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    types: [reopened]
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  PUBLISHED_MAIN: 657aa19fd0a746e2dc9983f50e601c8078fa945f
   UPSTREAM_SHA: 4075c8fd5ade673c93f757903b003ddc52603577
-  FULLY_VALIDATED_UPSTREAM: 9076adaca58b3c3b1839c42228f97410ddb43722
-  ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
-  ORIGINAL_MERGE_BASE: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
-  CUSTOM_COUNT: '10'
 
 jobs:
-  update:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
-      - name: Check out original fork head
-        uses: actions/checkout@v4
-        with:
-          ref: 48401e2dfdfd060eadbcfecd479c98aafee14482
-          fetch-depth: 0
-
-      - name: Audit and replay exact custom stack
+      - name: Verify publication and remove temporary branches
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          git config user.name 'qixiaoz-maintenance[bot]'
-          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch upstream main --no-tags
-          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
-          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
-          test "$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")" = "$ORIGINAL_MERGE_BASE"
-          mapfile -t commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
-          test "${#commits[@]}" = "$CUSTOM_COUNT"
-          : > /tmp/original-subjects
-          : > /tmp/original-patchids
-          for commit in "${commits[@]}"; do
-            git show -s --format='%s' "$commit" >> /tmp/original-subjects
-            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/original-patchids
+          remote_main=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          test "$remote_main" = "$PUBLISHED_MAIN"
+          upstream_main=$(git ls-remote https://github.com/NousResearch/hermes-agent.git refs/heads/main | awk '{print $1}')
+          test "$upstream_main" = "$UPSTREAM_SHA"
+
+          mapfile -t branches < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/branches?per_page=100" --jq '.[].name' | grep -E '^(agent/|fork-maintenance/)' || true)
+          printf 'Deleting %s temporary branches\n' "${#branches[@]}"
+          for branch in "${branches[@]}"; do
+            echo "delete $branch"
+            encoded=${branch//\//%2F}
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${encoded}"
           done
-          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
-          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
-          ! grep -q '^-' /tmp/cherry
-          git checkout -B atomic-candidate "$ORIGINAL_HEAD"
-          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
-          candidate=$(git rev-parse HEAD)
-          echo "CANDIDATE_SHA=$candidate" >> "$GITHUB_ENV"
-          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
-          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
-          test "$(git rev-list --merges --count "$UPSTREAM_SHA..$candidate")" = 0
-          : > /tmp/candidate-subjects
-          : > /tmp/candidate-patchids
-          while read -r commit; do
-            git show -s --format='%s' "$commit" >> /tmp/candidate-subjects
-            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/candidate-patchids
-          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
-          diff -u /tmp/original-subjects /tmp/candidate-subjects
-          diff -u /tmp/original-patchids /tmp/candidate-patchids
-          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
-          git diff --check "$UPSTREAM_SHA..$candidate"
-          git diff --name-only "$FULLY_VALIDATED_UPSTREAM..$UPSTREAM_SHA" | sort -u > /tmp/upstream-increment-files
-          git diff --name-only "$UPSTREAM_SHA..$candidate" | sort -u > /tmp/custom-files
-          echo 'Upstream increment:'; cat /tmp/upstream-increment-files
-          echo 'Custom stack:'; cat /tmp/custom-files
-          test -z "$(comm -12 /tmp/upstream-increment-files /tmp/custom-files)"
-          git log --oneline --reverse "$UPSTREAM_SHA..$candidate"
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
-        with:
-          version: '0.9.28'
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
-
-      - name: Create identical upstream original and candidate environments
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          uv python install 3.11
-          git worktree add --detach /tmp/hermes-upstream "$UPSTREAM_SHA"
-          git worktree add --detach /tmp/hermes-original "$ORIGINAL_HEAD"
-          args=(--locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web)
-          uv sync "${args[@]}"
-          (cd /tmp/hermes-upstream && uv sync "${args[@]}")
-          (cd /tmp/hermes-original && uv sync "${args[@]}")
-
-      - name: Ruff and Windows guardrails
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          uv run ruff check .
-          uv run python scripts/check-windows-footguns.py --all
-
-      - name: Scoped three-way type provenance
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          uv tool install 'ty==0.0.66'
-          (cd /tmp/hermes-upstream && ty check --output-format gitlab --exit-zero > /tmp/type-upstream.json)
-          (cd /tmp/hermes-original && ty check --output-format gitlab --exit-zero > /tmp/type-original.json)
-          ty check --output-format gitlab --exit-zero > /tmp/type-candidate.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          roots = ['/tmp/hermes-upstream/', '/tmp/hermes-original/', str(Path.cwd()) + '/']
-          def load(path):
-              out = set()
-              for item in json.loads(Path(path).read_text()):
-                  loc = item.get('location') or {}
-                  filename = str(loc.get('path', '')).replace('\\', '/')
-                  for root in roots:
-                      filename = filename.replace(root, '')
-                  out.add((filename, item.get('check_name', ''), item.get('description', '')))
-              return out
-          upstream = load('/tmp/type-upstream.json')
-          original = load('/tmp/type-original.json')
-          candidate = load('/tmp/type-candidate.json')
-          new = sorted(candidate - (upstream | original))
-          protected = set(Path('/tmp/custom-files').read_text().splitlines())
-          protected |= set(Path('/tmp/upstream-increment-files').read_text().splitlines())
-          scoped_new = [item for item in new if item[0] in protected]
-          print(f'upstream={len(upstream)} original={len(original)} candidate={len(candidate)}')
-          print(f'candidate-only-provenance={len(new)} protected-scope-new={len(scoped_new)}')
-          for item in new[:100]: print('UNTOUCHED_DIAGNOSTIC_DRIFT', item)
-          if len(candidate) > len(upstream) or scoped_new:
-              raise SystemExit(1)
-          PY
-
-      - name: Latest upstream incremental regressions
-        shell: bash
-        env:
-          OPENROUTER_API_KEY: ''
-          OPENAI_API_KEY: ''
-          NOUS_API_KEY: ''
-        run: |
-          set -Eeuo pipefail
-          uv run pytest -q --tb=short \
-            tests/agent/test_credential_pool_lease_refresh_reselect.py \
-            tests/agent/test_credential_pool_quarantine_locking.py \
-            tests/gateway/test_api_server.py \
-            tests/gateway/test_sse_agent_cancel.py \
-            tests/gateway/test_sse_frame.py
-
-      - name: Custom stack regressions
-        shell: bash
-        env:
-          OPENROUTER_API_KEY: ''
-          OPENAI_API_KEY: ''
-          NOUS_API_KEY: ''
-        run: |
-          set -Eeuo pipefail
-          uv run pytest -q --tb=short \
-            tests/gateway/test_qqbot.py \
-            tests/honcho_plugin/test_async_memory.py \
-            tests/hermes_cli/test_web_server_host_header.py \
-            tests/hermes_cli/test_web_server_profile_unification.py \
-            tests/tools/test_minimax_text_normalization.py \
-            tests/tools/test_tts_speed.py
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24.15.0'
-          cache: npm
-
-      - name: TUI check for upstream text changes
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          npm install -g npm@12
-          npm ci
-          npm run --prefix ui-tui check
-
-      - name: Atomic final lock and publish
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git fetch upstream main --no-tags
-          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
-          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
-          git push --force-with-lease=refs/heads/main:$ORIGINAL_HEAD origin "$CANDIDATE_SHA:refs/heads/main"
-          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$CANDIDATE_SHA"
-          echo "PUBLISHED_MAIN=$CANDIDATE_SHA"
+          remaining=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/branches?per_page=100" --jq '.[].name' | grep -E '^(agent/|fork-maintenance/)' || true)
+          test -z "$remaining"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')" = "$PUBLISHED_MAIN"
