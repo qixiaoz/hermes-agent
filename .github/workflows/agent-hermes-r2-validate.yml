@@ -1,4 +1,4 @@
-name: Agent Hermes R2 CI audit
+name: Agent Hermes final incremental gate
 
 on:
   pull_request:
@@ -7,69 +7,133 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 env:
-  AUDITED_RUN_ID: '30888195682'
-  CANDIDATE_SHA: dbca34914af25a0f95d1dc0e2baf2a7215a2b6c0
+  CANDIDATE_SHA: 6250bb4980a9c3e849a51f0a4037225e07661732
+  UPSTREAM_SHA: db0bd42119ae41e33b120aaecae89955f0898c24
+  PREVIOUS_VALIDATED_UPSTREAM: 9076adaca58b3c3b1839c42228f97410ddb43722
+  ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  CUSTOM_COUNT: '10'
 
 jobs:
-  audit:
+  incremental-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
-      - name: Audit every final candidate CI job
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check out exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: 6250bb4980a9c3e849a51f0a4037225e07661732
+          fetch-depth: 0
+
+      - name: Verify topology and non-overlap with upstream increment
         shell: bash
         run: |
           set -Eeuo pipefail
-          curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${AUDITED_RUN_ID}/jobs?per_page=100" > /tmp/jobs.json
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git merge-base HEAD upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count upstream/main..HEAD)" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges --count upstream/main..HEAD)" = 0
+          git diff --check upstream/main..HEAD
+          git diff --name-only "$PREVIOUS_VALIDATED_UPSTREAM..$UPSTREAM_SHA" | sort -u > /tmp/upstream-increment-files
+          git diff --name-only "$UPSTREAM_SHA..$CANDIDATE_SHA" | sort -u > /tmp/custom-files
+          echo 'Upstream increment:'; cat /tmp/upstream-increment-files
+          echo 'Custom stack:'; cat /tmp/custom-files
+          test ! -s <(comm -12 /tmp/upstream-increment-files /tmp/custom-files)
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: '0.9.28'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Build identical candidate and upstream environments
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv python install 3.11
+          git worktree add --detach /tmp/hermes-upstream "$UPSTREAM_SHA"
+          args=(--locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web)
+          uv sync "${args[@]}"
+          (cd /tmp/hermes-upstream && uv sync "${args[@]}")
+
+      - name: Ruff and Windows guardrails
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run ruff check .
+          uv run python scripts/check-windows-footguns.py --all
+
+      - name: Equal-environment type delta
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv tool install 'ty==0.0.66'
+          (cd /tmp/hermes-upstream && ty check --output-format gitlab --exit-zero > /tmp/type-upstream.json)
+          ty check --output-format gitlab --exit-zero > /tmp/type-candidate.json
           python3 - <<'PY'
           import json
           from pathlib import Path
 
-          jobs = json.loads(Path('/tmp/jobs.json').read_text())['jobs']
-          print(f'total_jobs={len(jobs)}')
-          for job in jobs:
-              print(f"{job['conclusion'] or job['status']:>12}  {job['name']}")
-
-          by_name = {job['name']: job['conclusion'] for job in jobs}
-          expected = {
-              'Docs Site / docs-site-checks',
-              'Python tests / e2e',
-              'Python lints / ruff + ty diff',
-              'Python lints / ruff enforcement (blocking)',
-              'Python lints / Windows footguns (blocking)',
-              'Check uv.lock / uv lock --check',
-              'OSV scan / Scan lockfiles / osv-scan',
-              'Supply-chain scan / Scan PR for critical supply chain risks',
-              'Supply-chain scan / Check PyPI dependency upper bounds',
-              'package-lock.json diff / package-lock.json semantic diff',
-              'Review label gate / Review label gate',
-              'Lint Docker scripts / Lint Dockerfile (hadolint)',
-              'Lint Docker scripts / Lint docker/ shell scripts (shellcheck)',
-          }
-          expected.update(f'Python tests / Run tests slice {i}/8' for i in range(1, 9))
-          missing_or_bad = {name: by_name.get(name) for name in expected if by_name.get(name) != 'success'}
-
-          js_jobs = {name: result for name, result in by_name.items() if name.startswith('JS & TS checks /')}
-          bad_js = {name: result for name, result in js_jobs.items() if result != 'success'}
-          if len(js_jobs) < 10:
-              missing_or_bad['JS & TS job coverage'] = len(js_jobs)
-
-          failures = {name for name, result in by_name.items() if result == 'failure'}
-          allowed_failures = {'Check contributors / check-attribution', 'All required checks pass'}
-          unexpected_failures = failures - allowed_failures
-
-          print('missing_or_bad=', missing_or_bad)
-          print('bad_js=', bad_js)
-          print('failures=', sorted(failures))
-          print('unexpected_failures=', sorted(unexpected_failures))
-          if missing_or_bad or bad_js or unexpected_failures:
-              raise SystemExit(1)
-          if by_name.get('Check contributors / check-attribution') != 'failure':
-              raise SystemExit('expected PR-only attribution mismatch was not observed')
-          print('AUDIT_OK: all executable code, test, docs, JS/TS, lockfile, lint and security gates passed; only attribution and its aggregate remain')
+          roots = ['/tmp/hermes-upstream/', str(Path.cwd()) + '/']
+          def load(path):
+              out = set()
+              for item in json.loads(Path(path).read_text()):
+                  loc = item.get('location') or {}
+                  filename = str(loc.get('path', '')).replace('\\', '/')
+                  for root in roots:
+                      filename = filename.replace(root, '')
+                  out.add((filename, item.get('check_name', ''), item.get('description', '')))
+              return out
+          upstream = load('/tmp/type-upstream.json')
+          candidate = load('/tmp/type-candidate.json')
+          new = sorted(candidate - upstream)
+          print(f'upstream={len(upstream)} candidate={len(candidate)} candidate-only={len(new)}')
+          for item in new[:100]: print('NEW', item)
+          if new: raise SystemExit(1)
           PY
+
+      - name: Custom and upstream-increment Python regressions
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -Eeuo pipefail
+          uv run pytest -q --tb=short \
+            tests/gateway/ \
+            tests/agent/test_credential_pool_lease_refresh_reselect.py \
+            tests/honcho_plugin/test_async_memory.py \
+            tests/hermes_cli/test_web_server_host_header.py \
+            tests/hermes_cli/test_web_server_profile_unification.py \
+            tests/tools/test_minimax_text_normalization.py \
+            tests/tools/test_tts_speed.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.0'
+          cache: npm
+
+      - name: TUI checks for upstream text increment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install -g npm@12
+          npm ci
+          npm run --prefix ui-tui check
+
+      - name: Final ref lock
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          echo "FINAL_INCREMENTAL_GATE_OK=$CANDIDATE_SHA"
