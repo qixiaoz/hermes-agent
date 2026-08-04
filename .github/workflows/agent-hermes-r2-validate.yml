@@ -1,4 +1,4 @@
-name: Agent Hermes final incremental gate
+name: Agent Hermes atomic update
 
 on:
   pull_request:
@@ -6,43 +6,76 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: read
+  contents: write
 
 env:
-  CANDIDATE_SHA: 6250bb4980a9c3e849a51f0a4037225e07661732
-  UPSTREAM_SHA: db0bd42119ae41e33b120aaecae89955f0898c24
-  PREVIOUS_VALIDATED_UPSTREAM: 9076adaca58b3c3b1839c42228f97410ddb43722
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_SHA: 4075c8fd5ade673c93f757903b003ddc52603577
+  FULLY_VALIDATED_UPSTREAM: 9076adaca58b3c3b1839c42228f97410ddb43722
   ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  ORIGINAL_MERGE_BASE: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
   CUSTOM_COUNT: '10'
 
 jobs:
-  incremental-gate:
+  update:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
-      - name: Check out exact candidate
+      - name: Check out original fork head
         uses: actions/checkout@v4
         with:
-          ref: 6250bb4980a9c3e849a51f0a4037225e07661732
+          ref: 48401e2dfdfd060eadbcfecd479c98aafee14482
           fetch-depth: 0
 
-      - name: Verify topology and non-overlap with upstream increment
+      - name: Audit and replay exact custom stack
         shell: bash
         run: |
           set -Eeuo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
           git fetch upstream main --no-tags
           test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
-          test "$(git merge-base HEAD upstream/main)" = "$UPSTREAM_SHA"
-          test "$(git rev-list --count upstream/main..HEAD)" = "$CUSTOM_COUNT"
-          test "$(git rev-list --merges --count upstream/main..HEAD)" = 0
-          git diff --check upstream/main..HEAD
-          git diff --name-only "$PREVIOUS_VALIDATED_UPSTREAM..$UPSTREAM_SHA" | sort -u > /tmp/upstream-increment-files
-          git diff --name-only "$UPSTREAM_SHA..$CANDIDATE_SHA" | sort -u > /tmp/custom-files
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          test "$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")" = "$ORIGINAL_MERGE_BASE"
+
+          mapfile -t commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
+          test "${#commits[@]}" = "$CUSTOM_COUNT"
+          : > /tmp/original-subjects
+          : > /tmp/original-patchids
+          for commit in "${commits[@]}"; do
+            git show -s --format='%s' "$commit" >> /tmp/original-subjects
+            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/original-patchids
+          done
+          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
+          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
+          ! grep -q '^-' /tmp/cherry
+
+          git checkout -B atomic-candidate "$ORIGINAL_HEAD"
+          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
+          candidate=$(git rev-parse HEAD)
+          echo "CANDIDATE_SHA=$candidate" >> "$GITHUB_ENV"
+          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges --count "$UPSTREAM_SHA..$candidate")" = 0
+
+          : > /tmp/candidate-subjects
+          : > /tmp/candidate-patchids
+          while read -r commit; do
+            git show -s --format='%s' "$commit" >> /tmp/candidate-subjects
+            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/candidate-patchids
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
+          diff -u /tmp/original-subjects /tmp/candidate-subjects
+          diff -u /tmp/original-patchids /tmp/candidate-patchids
+          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
+          git diff --check "$UPSTREAM_SHA..$candidate"
+          git diff --name-only "$FULLY_VALIDATED_UPSTREAM..$UPSTREAM_SHA" | sort -u > /tmp/upstream-increment-files
+          git diff --name-only "$UPSTREAM_SHA..$candidate" | sort -u > /tmp/custom-files
           echo 'Upstream increment:'; cat /tmp/upstream-increment-files
           echo 'Custom stack:'; cat /tmp/custom-files
-          test ! -s <(comm -12 /tmp/upstream-increment-files /tmp/custom-files)
+          overlap=$(comm -12 /tmp/upstream-increment-files /tmp/custom-files)
+          test -z "$overlap"
+          git log --oneline --reverse "$UPSTREAM_SHA..$candidate"
 
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
@@ -52,7 +85,7 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Build identical candidate and upstream environments
+      - name: Create identical upstream and candidate environments
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -98,7 +131,7 @@ jobs:
           if new: raise SystemExit(1)
           PY
 
-      - name: Latest upstream regression tests
+      - name: Latest upstream incremental regressions
         shell: bash
         env:
           OPENROUTER_API_KEY: ''
@@ -108,11 +141,12 @@ jobs:
           set -Eeuo pipefail
           uv run pytest -q --tb=short \
             tests/agent/test_credential_pool_lease_refresh_reselect.py \
+            tests/agent/test_credential_pool_quarantine_locking.py \
             tests/gateway/test_api_server.py \
             tests/gateway/test_sse_agent_cancel.py \
             tests/gateway/test_sse_frame.py
 
-      - name: Custom stack regression tests
+      - name: Custom stack regressions
         shell: bash
         env:
           OPENROUTER_API_KEY: ''
@@ -133,7 +167,7 @@ jobs:
           node-version: '22.22.0'
           cache: npm
 
-      - name: TUI checks for upstream text increment
+      - name: TUI check for upstream text changes
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -141,7 +175,7 @@ jobs:
           npm ci
           npm run --prefix ui-tui check
 
-      - name: Final ref lock
+      - name: Atomic final lock and publish
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -149,4 +183,6 @@ jobs:
           git fetch upstream main --no-tags
           test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
-          echo "FINAL_INCREMENTAL_GATE_OK=$CANDIDATE_SHA"
+          git push --force-with-lease=refs/heads/main:$ORIGINAL_HEAD origin "$CANDIDATE_SHA:refs/heads/main"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$CANDIDATE_SHA"
+          echo "PUBLISHED_MAIN=$CANDIDATE_SHA"
