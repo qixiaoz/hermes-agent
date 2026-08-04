@@ -10,7 +10,7 @@ permissions:
 
 env:
   UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
-  UPSTREAM_SHA: 9076adaca58b3c3b1839c42228f97410ddb43722
+  UPSTREAM_SHA: db0bd42119ae41e33b120aaecae89955f0898c24
   ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
   ORIGINAL_MERGE_BASE: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
   CANDIDATE_BRANCH: agent/hermes-candidate-20260804
