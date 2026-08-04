@@ -85,15 +85,17 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Create identical upstream and candidate environments
+      - name: Create identical upstream original and candidate environments
         shell: bash
         run: |
           set -Eeuo pipefail
           uv python install 3.11
           git worktree add --detach /tmp/hermes-upstream "$UPSTREAM_SHA"
+          git worktree add --detach /tmp/hermes-original "$ORIGINAL_HEAD"
           args=(--locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web)
           uv sync "${args[@]}"
           (cd /tmp/hermes-upstream && uv sync "${args[@]}")
+          (cd /tmp/hermes-original && uv sync "${args[@]}")
 
       - name: Ruff and Windows guardrails
         shell: bash
@@ -102,18 +104,19 @@ jobs:
           uv run ruff check .
           uv run python scripts/check-windows-footguns.py --all
 
-      - name: Equal-environment type delta
+      - name: Three-way type provenance
         shell: bash
         run: |
           set -Eeuo pipefail
           uv tool install 'ty==0.0.66'
           (cd /tmp/hermes-upstream && ty check --output-format gitlab --exit-zero > /tmp/type-upstream.json)
+          (cd /tmp/hermes-original && ty check --output-format gitlab --exit-zero > /tmp/type-original.json)
           ty check --output-format gitlab --exit-zero > /tmp/type-candidate.json
           python3 - <<'PY'
           import json
           from pathlib import Path
 
-          roots = ['/tmp/hermes-upstream/', str(Path.cwd()) + '/']
+          roots = ['/tmp/hermes-upstream/', '/tmp/hermes-original/', str(Path.cwd()) + '/']
           def load(path):
               out = set()
               for item in json.loads(Path(path).read_text()):
@@ -124,11 +127,15 @@ jobs:
                   out.add((filename, item.get('check_name', ''), item.get('description', '')))
               return out
           upstream = load('/tmp/type-upstream.json')
+          original = load('/tmp/type-original.json')
           candidate = load('/tmp/type-candidate.json')
-          new = sorted(candidate - upstream)
-          print(f'upstream={len(upstream)} candidate={len(candidate)} candidate-only={len(new)}')
+          new = sorted(candidate - (upstream | original))
+          touched = set(Path('/tmp/custom-files').read_text().splitlines())
+          touched_new = [item for item in new if item[0] in touched]
+          print(f'upstream={len(upstream)} original={len(original)} candidate={len(candidate)}')
+          print(f'new-after-replay={len(new)} touched-new={len(touched_new)}')
           for item in new[:100]: print('NEW', item)
-          if new: raise SystemExit(1)
+          if new or touched_new: raise SystemExit(1)
           PY
 
       - name: Latest upstream incremental regressions
