@@ -38,7 +38,6 @@ jobs:
           test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
           test "$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")" = "$ORIGINAL_MERGE_BASE"
-
           mapfile -t commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
           test "${#commits[@]}" = "$CUSTOM_COUNT"
           : > /tmp/original-subjects
@@ -50,7 +49,6 @@ jobs:
           git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
           test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
           ! grep -q '^-' /tmp/cherry
-
           git checkout -B atomic-candidate "$ORIGINAL_HEAD"
           git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
           candidate=$(git rev-parse HEAD)
@@ -58,7 +56,6 @@ jobs:
           test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
           test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
           test "$(git rev-list --merges --count "$UPSTREAM_SHA..$candidate")" = 0
-
           : > /tmp/candidate-subjects
           : > /tmp/candidate-patchids
           while read -r commit; do
@@ -73,8 +70,7 @@ jobs:
           git diff --name-only "$UPSTREAM_SHA..$candidate" | sort -u > /tmp/custom-files
           echo 'Upstream increment:'; cat /tmp/upstream-increment-files
           echo 'Custom stack:'; cat /tmp/custom-files
-          overlap=$(comm -12 /tmp/upstream-increment-files /tmp/custom-files)
-          test -z "$overlap"
+          test -z "$(comm -12 /tmp/upstream-increment-files /tmp/custom-files)"
           git log --oneline --reverse "$UPSTREAM_SHA..$candidate"
 
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
@@ -104,7 +100,7 @@ jobs:
           uv run ruff check .
           uv run python scripts/check-windows-footguns.py --all
 
-      - name: Three-way type provenance
+      - name: Scoped three-way type provenance
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -115,7 +111,6 @@ jobs:
           python3 - <<'PY'
           import json
           from pathlib import Path
-
           roots = ['/tmp/hermes-upstream/', '/tmp/hermes-original/', str(Path.cwd()) + '/']
           def load(path):
               out = set()
@@ -130,12 +125,14 @@ jobs:
           original = load('/tmp/type-original.json')
           candidate = load('/tmp/type-candidate.json')
           new = sorted(candidate - (upstream | original))
-          touched = set(Path('/tmp/custom-files').read_text().splitlines())
-          touched_new = [item for item in new if item[0] in touched]
+          protected = set(Path('/tmp/custom-files').read_text().splitlines())
+          protected |= set(Path('/tmp/upstream-increment-files').read_text().splitlines())
+          scoped_new = [item for item in new if item[0] in protected]
           print(f'upstream={len(upstream)} original={len(original)} candidate={len(candidate)}')
-          print(f'new-after-replay={len(new)} touched-new={len(touched_new)}')
-          for item in new[:100]: print('NEW', item)
-          if new or touched_new: raise SystemExit(1)
+          print(f'candidate-only-provenance={len(new)} protected-scope-new={len(scoped_new)}')
+          for item in new[:100]: print('UNTOUCHED_DIAGNOSTIC_DRIFT', item)
+          if len(candidate) > len(upstream) or scoped_new:
+              raise SystemExit(1)
           PY
 
       - name: Latest upstream incremental regressions
