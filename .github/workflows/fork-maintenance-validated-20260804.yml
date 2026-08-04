@@ -1,0 +1,233 @@
+name: Hermes fork maintenance validated 2026-08-04
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-fork-maintenance-validated-20260804
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_SHA: 91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53
+  ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  ORIGINAL_MERGE_BASE: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
+  TARGET_BRANCH: main
+  MAINT_BRANCH: fork-maintenance/hermes-validated-20260804-1016
+  CUSTOM_COUNT: '10'
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Audit patch stack and replay without edits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main --no-tags
+
+          start_upstream=$(git rev-parse upstream/main)
+          start_fork=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          merge_base=$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")
+          printf 'START_UPSTREAM=%s\nSTART_FORK=%s\nMERGE_BASE=%s\n' "$start_upstream" "$start_fork" "$merge_base"
+          test "$start_upstream" = "$UPSTREAM_SHA"
+          test "$start_fork" = "$ORIGINAL_HEAD"
+          test "$merge_base" = "$ORIGINAL_MERGE_BASE"
+
+          mapfile -t original_commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
+          test "${#original_commits[@]}" = "$CUSTOM_COUNT"
+          : > /tmp/original-subjects
+          : > /tmp/original-patchids
+          for commit in "${original_commits[@]}"; do
+            subject=$(git show -s --format='%s' "$commit")
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$subject"
+            printf '%s\n' "$subject" >> /tmp/original-subjects
+            printf '%s\n' "$patch_id" >> /tmp/original-patchids
+          done
+
+          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
+          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
+          if grep -q '^-' /tmp/cherry; then
+            echo 'A custom patch is already represented upstream; semantic review required.'
+            exit 21
+          fi
+
+          git checkout -B maintenance-candidate "$ORIGINAL_HEAD"
+          set +e
+          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
+          rebase_rc=$?
+          set -e
+          if [ "$rebase_rc" -ne 0 ]; then
+            echo "REBASE_EXIT_CODE=$rebase_rc"
+            git diff --name-only --diff-filter=U || true
+            git status --short || true
+            git rebase --show-current-patch || true
+            git rebase --abort || true
+            exit 22
+          fi
+
+          candidate=$(git rev-parse HEAD)
+          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges "$UPSTREAM_SHA..$candidate" | wc -l)" = 0
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$candidate"
+
+          : > /tmp/candidate-subjects
+          : > /tmp/candidate-patchids
+          while read -r commit; do
+            subject=$(git show -s --format='%s' "$commit")
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$subject"
+            printf '%s\n' "$subject" >> /tmp/candidate-subjects
+            printf '%s\n' "$patch_id" >> /tmp/candidate-patchids
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
+          diff -u /tmp/original-subjects /tmp/candidate-subjects
+          diff -u /tmp/original-patchids /tmp/candidate-patchids
+          git diff --check "$UPSTREAM_SHA..$candidate"
+          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
+          git diff --name-only "$UPSTREAM_SHA..$candidate" > /tmp/custom-touched-files
+          cat /tmp/custom-touched-files
+          echo "CANDIDATE_SHA=$candidate" | tee -a "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: '0.9.28'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Create identical locked environments for upstream and candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv python install 3.11
+          git worktree add --detach /tmp/hermes-upstream "$UPSTREAM_SHA"
+          sync_args=(--locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web)
+          (cd /tmp/hermes-upstream && uv sync "${sync_args[@]}")
+          (cd "$GITHUB_WORKSPACE" && uv sync "${sync_args[@]}")
+
+      - name: Ruff and repository guardrails
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run ruff check .
+          uv run python scripts/check-windows-footguns.py --all
+
+      - name: Type-check differential in identical environments
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv tool install ty
+          mkdir -p /tmp/type-reports
+          (cd /tmp/hermes-upstream && ty check --output-format gitlab --exit-zero > /tmp/type-reports/base.json)
+          (cd "$GITHUB_WORKSPACE" && ty check --output-format gitlab --exit-zero > /tmp/type-reports/head.json)
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          roots = {
+              '/tmp/hermes-upstream/': '',
+              str(Path.cwd()) + '/': '',
+          }
+
+          def load(path):
+              value = json.loads(Path(path).read_text(encoding='utf-8'))
+              assert isinstance(value, list)
+              return value
+
+          def norm_path(value):
+              value = str(value or '').replace('\\', '/')
+              for prefix, replacement in roots.items():
+                  value = value.replace(prefix, replacement)
+              return value
+
+          def key(item):
+              location = item.get('location') or {}
+              return (
+                  norm_path(location.get('path', '')),
+                  item.get('check_name', 'unknown'),
+                  item.get('description', ''),
+              )
+
+          base = {key(item) for item in load('/tmp/type-reports/base.json')}
+          head = {key(item) for item in load('/tmp/type-reports/head.json')}
+          new = sorted(head - base)
+          touched = set(Path('/tmp/custom-touched-files').read_text().splitlines())
+          touched_new = [item for item in new if item[0] in touched]
+          print(f'upstream diagnostics={len(base)} candidate diagnostics={len(head)}')
+          print(f'new overall={len(new)} new in custom-touched files={len(touched_new)}')
+          for item in new[:100]:
+              print('NEW', item)
+          if new or touched_new:
+              raise SystemExit(1)
+          PY
+
+      - name: Run Python unit tests
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+          HERMES_TEST_WORKERS: '4'
+        run: |
+          set -Eeuo pipefail
+          source .venv/bin/activate
+          python scripts/run_tests_parallel.py -q --tb=short
+
+      - name: Run Python end-to-end tests
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -Eeuo pipefail
+          source .venv/bin/activate
+          python -m pytest tests/e2e/ -v --tb=short
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.0'
+          cache: npm
+
+      - name: JavaScript and TypeScript checks and desktop build
+        run: |
+          set -Eeuo pipefail
+          npm install -g npm@12
+          npm ci
+          npm run check
+          npm run build --workspace apps/desktop
+
+      - name: Recheck refs and publish with exact lease
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch upstream main --no-tags
+          end_upstream=$(git rev-parse upstream/main)
+          remote_target=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          printf 'END_UPSTREAM=%s\nREMOTE_TARGET_BEFORE=%s\nCANDIDATE_SHA=%s\n' "$end_upstream" "$remote_target" "$CANDIDATE_SHA"
+          test "$end_upstream" = "$UPSTREAM_SHA"
+          test "$remote_target" = "$ORIGINAL_HEAD"
+          git push --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIGINAL_HEAD" origin "$CANDIDATE_SHA:refs/heads/$TARGET_BRANCH"
+          remote_after=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          test "$remote_after" = "$CANDIDATE_SHA"
+          echo "REMOTE_TARGET_AFTER=$remote_after"
+
+      - name: Remove temporary maintenance branch
+        if: always()
+        shell: bash
+        run: git push origin --delete "$MAINT_BRANCH" || true
