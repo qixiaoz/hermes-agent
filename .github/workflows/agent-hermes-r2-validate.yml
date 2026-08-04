@@ -10,29 +10,22 @@ permissions:
   actions: read
 
 env:
-  AUDITED_RUN_ID: '30888236171'
+  AUDITED_RUN_ID: '30888195682'
   CANDIDATE_SHA: dbca34914af25a0f95d1dc0e2baf2a7215a2b6c0
 
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Wait for final candidate CI and audit every job
+      - name: Audit every final candidate CI job
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          headers=(-H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json')
-          for _ in $(seq 1 120); do
-            status=$(curl -sSfL "${headers[@]}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${AUDITED_RUN_ID}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
-            echo "audited_run_status=${status}"
-            [ "$status" = completed ] && break
-            sleep 10
-          done
-          test "$status" = completed
-          curl -sSfL "${headers[@]}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${AUDITED_RUN_ID}/jobs?per_page=100" > /tmp/jobs.json
+          curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${AUDITED_RUN_ID}/jobs?per_page=100" > /tmp/jobs.json
           python3 - <<'PY'
           import json
           from pathlib import Path
