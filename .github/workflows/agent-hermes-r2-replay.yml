@@ -1,0 +1,82 @@
+name: Agent Hermes R2 replay
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_SHA: 743dc94ab90adb0529bb233b8498c6fd6ee0e020
+  ORIGINAL_HEAD: 48401e2dfdfd060eadbcfecd479c98aafee14482
+  ORIGINAL_MERGE_BASE: a4a91610b05acc75b4d76c077a5cd89c1ee066ba
+  CANDIDATE_BRANCH: agent/hermes-candidate-20260804
+  CUSTOM_COUNT: '10'
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Audit and replay custom stack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          test "$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")" = "$ORIGINAL_MERGE_BASE"
+
+          mapfile -t commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
+          test "${#commits[@]}" = "$CUSTOM_COUNT"
+          : > /tmp/original-subjects
+          : > /tmp/original-patchids
+          for commit in "${commits[@]}"; do
+            git show -s --format='%s' "$commit" >> /tmp/original-subjects
+            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/original-patchids
+          done
+
+          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
+          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
+          ! grep -q '^-' /tmp/cherry
+
+          git checkout -B maintenance-candidate "$ORIGINAL_HEAD"
+          set +e
+          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "REBASE_EXIT_CODE=$rc"
+            git diff --name-only --diff-filter=U || true
+            git status --short || true
+            git rebase --show-current-patch || true
+            exit 22
+          fi
+
+          candidate=$(git rev-parse HEAD)
+          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges --count "$UPSTREAM_SHA..$candidate")" = 0
+          : > /tmp/candidate-subjects
+          : > /tmp/candidate-patchids
+          while read -r commit; do
+            git show -s --format='%s' "$commit" >> /tmp/candidate-subjects
+            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/candidate-patchids
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
+          diff -u /tmp/original-subjects /tmp/candidate-subjects
+          diff -u /tmp/original-patchids /tmp/candidate-patchids
+          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
+          git diff --check "$UPSTREAM_SHA..$candidate"
+          git push --force origin "$candidate:refs/heads/$CANDIDATE_BRANCH"
+          echo "CANDIDATE_SHA=$candidate"
+          git log --oneline --reverse "$UPSTREAM_SHA..$candidate"
