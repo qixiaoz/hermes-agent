@@ -98,7 +98,7 @@ jobs:
           if new: raise SystemExit(1)
           PY
 
-      - name: Custom and upstream-increment Python regressions
+      - name: Latest upstream regression tests
         shell: bash
         env:
           OPENROUTER_API_KEY: ''
@@ -107,8 +107,21 @@ jobs:
         run: |
           set -Eeuo pipefail
           uv run pytest -q --tb=short \
-            tests/gateway/ \
             tests/agent/test_credential_pool_lease_refresh_reselect.py \
+            tests/gateway/test_api_server.py \
+            tests/gateway/test_sse_agent_cancel.py \
+            tests/gateway/test_sse_frame.py
+
+      - name: Custom stack regression tests
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -Eeuo pipefail
+          uv run pytest -q --tb=short \
+            tests/gateway/test_qqbot.py \
             tests/honcho_plugin/test_async_memory.py \
             tests/hermes_cli/test_web_server_host_header.py \
             tests/hermes_cli/test_web_server_profile_unification.py \
