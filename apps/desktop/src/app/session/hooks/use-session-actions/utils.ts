@@ -7,8 +7,11 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
+  $cronSessions,
   $currentCwd,
+  $messagingSessions,
   $sessions,
+  findSessionInSources,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -840,7 +843,12 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 }
 
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
-  const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+  // The sidebar deliberately keeps recents, cron runs, and messaging sessions
+  // in separate bounded slices. Opening a row from one of the latter slices
+  // must still use its cached ownership before probing the active backend;
+  // otherwise a Cron run can be selected/highlighted while resume loses the
+  // profile that owns the session.
+  const cached = findSessionInSources(storedSessionId, $sessions.get(), $cronSessions.get(), $messagingSessions.get())
 
   // A row with no owning profile can't route a resume when more than one
   // profile exists — a resume without a profile lands on whichever gateway is

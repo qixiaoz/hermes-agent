@@ -31,14 +31,16 @@ import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
 import {
   $contextSuggestions,
+  $cronSessions,
   $freshDraftReady,
   $gatewayState,
   $introPersonality,
   $introSeed,
+  $messagingSessions,
   $resumeExhaustedSessionId,
   $sessions,
+  findSessionInSources,
   resolveComposerSessionKey,
-  sessionMatchesStoredId,
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
@@ -108,11 +110,12 @@ function ChatHeader({
   selectedSessionId
 }: ChatHeaderProps) {
   const sessions = useStore($sessions)
+  const cronSessions = useStore($cronSessions)
+  const messagingSessions = useStore($messagingSessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
 
-  const activeStoredSession =
-    (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
+  const activeStoredSession = findSessionInSources(selectedSessionId, sessions, cronSessions, messagingSessions) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 
@@ -312,7 +315,14 @@ export const ChatView = memo(function ChatView({
   const lastVisibleIsUser = useStore(view.$lastVisibleIsUser)
   const selectedSessionId = useStore(view.$storedId)
   const sessions = useStore($sessions)
+  const cronSessions = useStore($cronSessions)
+  const messagingSessions = useStore($messagingSessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
+
+  const sessionSources = useMemo(
+    () => [...sessions, ...cronSessions, ...messagingSessions],
+    [cronSessions, messagingSessions, sessions]
+  )
 
   // Durable composer/queue scope (lineage root) so auto-compression tip rotation
   // does not wipe an in-progress draft or orphan /queue entries. For the
@@ -325,8 +335,8 @@ export const ChatView = memo(function ChatView({
       ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
       : selectedSessionId
 
-    return resolveComposerSessionKey(effectiveSelectedSessionId, sessions)
-  }, [isPrimary, location.pathname, selectedSessionId, sessions])
+    return resolveComposerSessionKey(effectiveSelectedSessionId, sessionSources)
+  }, [isPrimary, location.pathname, selectedSessionId, sessionSources])
 
   // When the tip row arrives after compression, migrate any tip-keyed stash onto
   // the durable lineage key before the composer remounts onto that key.
@@ -336,13 +346,13 @@ export const ChatView = memo(function ChatView({
   // migrating on bare inequality would re-home A's queued prompts onto B and
   // auto-drain them into the wrong chat.
   useEffect(() => {
-    if (!shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessions)) {
+    if (!shouldMigrateComposerScope(selectedSessionId, queueSessionKey, sessionSources)) {
       return
     }
 
     migrateSessionDraft(selectedSessionId, queueSessionKey)
     migrateQueuedPrompts(selectedSessionId, queueSessionKey)
-  }, [queueSessionKey, selectedSessionId, sessions])
+  }, [queueSessionKey, selectedSessionId, sessionSources])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any

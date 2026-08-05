@@ -192,6 +192,26 @@ export const sessionMatchesStoredId = (
   storedSessionId: string
 ): boolean => session.id === storedSessionId || session._lineage_root_id === storedSessionId
 
+/** Find a stored session across the independently fetched sidebar slices. */
+export function findSessionInSources(
+  storedSessionId: null | string | undefined,
+  ...sources: readonly (readonly SessionInfo[])[]
+): SessionInfo | undefined {
+  if (!storedSessionId) {
+    return undefined
+  }
+
+  for (const source of sources) {
+    const session = source.find(row => sessionMatchesStoredId(row, storedSessionId))
+
+    if (session) {
+      return session
+    }
+  }
+
+  return undefined
+}
+
 /** True when two ids name the same conversation across compression tip rotation. */
 export function idsShareLineage(
   a: string,

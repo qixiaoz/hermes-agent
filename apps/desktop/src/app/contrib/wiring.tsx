@@ -49,6 +49,7 @@ import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projec
 import {
   $activeSessionId,
   $connection,
+  $cronSessions,
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
@@ -58,6 +59,7 @@ import {
   $resumeFailedSessionId,
   $selectedStoredSessionId,
   $sessions,
+  findSessionInSources,
   sessionMatchesStoredId,
   sessionPinId,
   setAwaitingResponse,
@@ -323,7 +325,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return
       }
 
-      const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
+      const storedProfile = findSessionInSources(
+        storedSessionId,
+        $sessions.get(),
+        $cronSessions.get(),
+        $messagingSessions.get()
+      )?.profile
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
@@ -792,7 +799,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    const session = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
+    const session = findSessionInSources(sessionId, $sessions.get(), $cronSessions.get(), $messagingSessions.get())
     const pinId = session ? sessionPinId(session) : sessionId
 
     if ($pinnedSessionIds.get().includes(pinId)) {

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as HermesModule from '@/hermes'
 import { getSession } from '@/hermes'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
-import { $sessions } from '@/store/session'
+import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { resolveSessionProfile, resolveStoredSession } from './utils'
@@ -22,6 +22,8 @@ const profiles = (...names: string[]) => names.map(name => ({ name }) as never)
 describe('resolveStoredSession profile ownership', () => {
   beforeEach(() => {
     $sessions.set([])
+    $cronSessions.set([])
+    $messagingSessions.set([])
     $profiles.set(profiles('default', 'meta'))
     $activeGatewayProfile.set('meta')
     mockGetSession.mockReset()
@@ -29,6 +31,8 @@ describe('resolveStoredSession profile ownership', () => {
 
   afterEach(() => {
     $sessions.set([])
+    $cronSessions.set([])
+    $messagingSessions.set([])
     $profiles.set([])
     $activeGatewayProfile.set('default')
   })
@@ -39,6 +43,15 @@ describe('resolveStoredSession profile ownership', () => {
     const resolved = await resolveStoredSession('s1')
 
     expect(resolved?.profile).toBe('default')
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('resolves a Cron row from its separate sidebar cache', async () => {
+    $cronSessions.set([session({ id: 'cron-1', profile: 'nahida', source: 'cron' })])
+
+    const resolved = await resolveStoredSession('cron-1')
+
+    expect(resolved?.profile).toBe('nahida')
     expect(mockGetSession).not.toHaveBeenCalled()
   })
 

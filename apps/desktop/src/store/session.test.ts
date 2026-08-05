@@ -12,6 +12,7 @@ import {
   $sessions,
   $unreadFinishedSessionIds,
   applyConfiguredDefaultProjectDir,
+  findSessionInSources,
   getRememberedRoute,
   getRememberedSessionId,
   mergeSessionPage,
@@ -92,6 +93,20 @@ describe('sessionPinId', () => {
     // After auto-compression the entry surfaces under a fresh tip id but keeps
     // the original root — pinning on the root keeps the pin stable.
     expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe('root')
+  })
+})
+
+describe('findSessionInSources', () => {
+  it('finds a row from a source-specific sidebar slice', () => {
+    const cron = session({ id: 'cron-1', source: 'cron', profile: 'nahida' })
+
+    expect(findSessionInSources('cron-1', [], [cron])?.profile).toBe('nahida')
+  })
+
+  it('matches a compressed lineage root across sources', () => {
+    const cron = session({ id: 'cron-tip', _lineage_root_id: 'cron-root', source: 'cron' })
+
+    expect(findSessionInSources('cron-root', [cron])).toBe(cron)
   })
 })
 

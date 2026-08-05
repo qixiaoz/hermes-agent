@@ -57,7 +57,15 @@ import {
 } from '@/store/layout'
 import { $previewOpenRequest, $previewTabs, closeRightRail } from '@/store/preview'
 import { $reviewOpen, closeReview, openReview, REVIEW_PANE_ID } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
+import {
+  $cronSessions,
+  $currentCwd,
+  $messagingSessions,
+  $selectedStoredSessionId,
+  $sessions,
+  $yoloActive,
+  findSessionInSources
+} from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
 
@@ -115,7 +123,7 @@ const workspaceDragPayload = (): SessionDragPayload | null => {
     return null
   }
 
-  const stored = $sessions.get().find(s => sessionMatchesStoredId(s, selected))
+  const stored = findSessionInSources(selected, $sessions.get(), $cronSessions.get(), $messagingSessions.get())
 
   return { id: selected, profile: stored?.profile ?? '', title: stored ? storedSessionTitle(stored) : '' }
 }
@@ -423,7 +431,10 @@ watchSessionPins()
 // above, so the pane content never remounts.
 const syncWorkspaceTitle = () => {
   const selected = $selectedStoredSessionId.get()
-  const stored = selected ? $sessions.get().find(s => sessionMatchesStoredId(s, selected)) : null
+
+  const stored = selected
+    ? findSessionInSources(selected, $sessions.get(), $cronSessions.get(), $messagingSessions.get())
+    : null
 
   registry.register({
     id: 'workspace',
@@ -448,6 +459,8 @@ const syncWorkspaceTitle = () => {
 
 $selectedStoredSessionId.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
+$cronSessions.listen(syncWorkspaceTitle)
+$messagingSessions.listen(syncWorkspaceTitle)
 $workspaceIsPage.listen(syncWorkspaceTitle)
 
 // Layout reset collapses every session tile into main as a tab (after the
