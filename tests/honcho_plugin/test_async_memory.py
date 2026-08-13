@@ -269,6 +269,30 @@ class TestFlushAll:
 # ---------------------------------------------------------------------------
 
 class TestAsyncWriterThread:
+    def test_fallback_queue_keeps_profile_home_in_worker_thread(
+        self, tmp_path, make_manager
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_home = tmp_path / "profiles" / "nahida"
+        profile_home.mkdir(parents=True)
+        token = set_hermes_home_override(profile_home)
+        try:
+            mgr = make_manager(write_frequency="turn")
+        finally:
+            reset_hermes_home_override(token)
+
+        resolved = []
+        thread = threading.Thread(target=lambda: resolved.append(mgr._get_fallback_dir()))
+        thread.start()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive()
+        assert resolved == [profile_home / "honcho_fallback"]
+
     def test_client_refresh_keeps_profile_config_in_worker_thread(self, make_manager):
         mgr = make_manager(write_frequency="turn")
         expected_client = MagicMock()
@@ -621,4 +645,3 @@ class TestPrefetchCacheAccessors:
 
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
-
